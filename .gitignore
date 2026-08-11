@@ -1,0 +1,8 @@
+# 上游参考实现与论文资料（体积大，不入库）
+reference/
+papers/
+
+# 通用忽略
+.DS_Store
+Thumbs.db
+*.log
