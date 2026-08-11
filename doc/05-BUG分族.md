@@ -19,6 +19,7 @@
   - exact 与 approx 分裂结果漂移
 - 典型证据（git 日志）：
   - LightGBM `src/treelearner` 目录 262 条提交中 158 条为修复类（60%，全场最高）；6 套分裂器（串行/3 种并行/GPU/linear）相互复制；"also fix / same issue / consistency" 类同步补丁 19 条
+  - LightGBM 结构性根源：`CreateTreeLearner` 工厂**硬编码列举 10+ 条 new 分支**（Serial 基类 + Feature/Data/Voting 模板包装 + Linear 嵌套 + GPU 复制一套），新增分裂器必须改工厂，结构上鼓励复制
   - XGBoost 39 条 CPU/GPU 一致性相关提交，近期才有 "Share the model view for CPU and GPU"（#11759）、"Merge approx tests"（#10583），此前分离维护
   - CatBoost GPU 路径全史修复率 28% 居首；`catboost/cuda` 出现 use-after-free（返回临时字符串指针）
 - 代价：修复放大（1 处 bug → N 处补丁）、漏修不对称、行为漂移。
