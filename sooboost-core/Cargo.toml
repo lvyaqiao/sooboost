@@ -3,6 +3,13 @@ name = "sooboost-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "纯 Rust 梯度提升决策树（GBDT）：no_unsafe、arrow 零拷贝、确定可复现"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/sooboost-core"
+readme = "../README.md"
+keywords = ["gbdt", "gradient-boosting", "decision-tree", "machine-learning", "arrow"]
+categories = ["algorithms", "science"]
 
 [dependencies]
 arrow = { version = "59.2.0", default-features = false }
