@@ -1,0 +1,16 @@
+{
+  "random_forest": {
+    "rmse": 5.726294877827041,
+    "mae": 4.514937146109994,
+    "r2": 0.3773977945047221,
+    "train_time_sec": 0.6081,
+    "predict_time_sec": 0.0098
+  },
+  "hist_gradient_boosting": {
+    "rmse": 5.7757178485294745,
+    "mae": 4.602284917656511,
+    "r2": 0.3666042042344564,
+    "train_time_sec": 0.3102,
+    "predict_time_sec": 0.0038
+  }
+}

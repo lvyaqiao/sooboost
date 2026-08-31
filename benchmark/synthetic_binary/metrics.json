@@ -1,0 +1,16 @@
+{
+  "random_forest": {
+    "accuracy": 0.8375,
+    "auc": 0.9165410511506381,
+    "log_loss": 0.3996408018854659,
+    "train_time_sec": 0.3652,
+    "predict_time_sec": 0.0119
+  },
+  "hist_gradient_boosting": {
+    "accuracy": 0.895,
+    "auc": 0.9490503466988242,
+    "log_loss": 0.30367087937908804,
+    "train_time_sec": 0.4071,
+    "predict_time_sec": 0.008
+  }
+}

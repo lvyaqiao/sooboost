@@ -1,0 +1,30 @@
+[package]
+name = "sooboost-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sooboost-core = { path = "../sooboost-core" }
+
+# 独立 workspace：不并入根 workspace（cargo-fuzz 需 nightly + libFuzzer sanitizer，
+# 根 workspace 的 stable CI/gate 不触碰本 crate）。
+[workspace]
+
+[[bin]]
+name = "model_deserialize"
+path = "fuzz_targets/model_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "csv_parse"
+path = "fuzz_targets/csv_parse.rs"
+test = false
+doc = false
+bench = false

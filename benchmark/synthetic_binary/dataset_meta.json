@@ -1,0 +1,11 @@
+{
+  "name": "synthetic_binary",
+  "task": "binary",
+  "source": "sklearn.datasets.make_classification(n_samples=2000, n_features=10, n_informative=7, n_redundant=2, n_clusters_per_class=2, flip_y=0.05, random_state=42)",
+  "n_samples": 2000,
+  "n_features": 10,
+  "n_train": 1600,
+  "n_test": 400,
+  "train_csv_sha256": "be3b99030eff6e5b363006ac5e718c8cd42be8c1bdb881c24143a813d414d6e8",
+  "test_csv_sha256": "b363059fe026e118cfd522e24494e9c04edfc7b3edd378a5c104fa67bcf00b7d"
+}

@@ -1,0 +1,16 @@
+{
+  "n_real": 400,
+  "n_generated": 400,
+  "mean_relative_error": 0.0721067587841041,
+  "std_relative_error": 0.08791712320723309,
+  "correlation_mae": 0.06118377948131418,
+  "real_offdiag_abs_corr": 0.044975173662013555,
+  "generated_offdiag_abs_corr": 0.04814470588887002,
+  "c2st_auc": 0.5862499999999999,
+  "imputation_feature": 3,
+  "max_train_pair_abs_corr": 0.04767624088286682,
+  "imputation_rmse": 1.177415424355475,
+  "imputation_baseline_rmse": 1.0931294697286158,
+  "imputation_relative_gain": -0.07710518923964638,
+  "imputation_samples": 4
+}

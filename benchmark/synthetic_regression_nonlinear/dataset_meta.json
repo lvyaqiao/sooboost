@@ -1,0 +1,11 @@
+{
+  "name": "synthetic_regression_nonlinear",
+  "task": "regression",
+  "source": "sklearn.datasets.make_friedman1(n_samples=2000, n_features=10, noise=5.0, random_state=42)",
+  "n_samples": 2000,
+  "n_features": 10,
+  "n_train": 1600,
+  "n_test": 400,
+  "train_csv_sha256": "59c3ef8b546111f2d235b98dba1c47ebee47771705a77ba4572865b981bd3a18",
+  "test_csv_sha256": "40fbda0203e049391fade9f3a64c6f8207891a4285ff8f99dc4e408bc05ce3f7"
+}

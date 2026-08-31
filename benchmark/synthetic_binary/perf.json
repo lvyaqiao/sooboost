@@ -1,0 +1,38 @@
+{
+  "model": "hist_gradient_boosting",
+  "params": {
+    "learning_rate": 0.1,
+    "max_iter": 100,
+    "max_leaf_nodes": 31,
+    "min_samples_leaf": 20,
+    "random_state": 42
+  },
+  "repeats": 5,
+  "train_time": {
+    "mean_sec": 0.3261,
+    "min_sec": 0.3108,
+    "max_sec": 0.3457,
+    "std_sec": 0.0136,
+    "raw_sec": [
+      0.3457,
+      0.3161,
+      0.3108,
+      0.3274,
+      0.3303
+    ]
+  },
+  "predict_time": {
+    "mean_sec": 0.0033,
+    "min_sec": 0.0027,
+    "max_sec": 0.0048,
+    "std_sec": 0.0008,
+    "raw_sec": [
+      0.003,
+      0.0031,
+      0.0029,
+      0.0048,
+      0.0027
+    ]
+  },
+  "note": "单机单次时间受负载影响；内存占用与模型大小未测量（v1 不含）"
+}

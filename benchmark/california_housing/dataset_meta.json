@@ -1,0 +1,11 @@
+{
+  "name": "california_housing",
+  "task": "regression",
+  "source": "sklearn.datasets.fetch_california_housing（依赖网络下载，无官方 checksum；目标 *100000 转美元；版本以 environment.json 生成时间为准）",
+  "n_samples": 20640,
+  "n_features": 8,
+  "n_train": 16512,
+  "n_test": 4128,
+  "train_csv_sha256": "34b9236676e26053a22e7a8b921419e1bbc9d3b4c7777456f0720c8a80ac5aa0",
+  "test_csv_sha256": "506b80e2ccf01883b00f09bdd0327bb16dfd25677b2a681e340d94fce015fa90"
+}

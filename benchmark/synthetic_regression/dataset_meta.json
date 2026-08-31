@@ -1,0 +1,11 @@
+{
+  "name": "synthetic_regression",
+  "task": "regression",
+  "source": "sklearn.datasets.make_regression(n_samples=2000, n_features=10, n_informative=7, noise=10.0, random_state=42)",
+  "n_samples": 2000,
+  "n_features": 10,
+  "n_train": 1600,
+  "n_test": 400,
+  "train_csv_sha256": "bf6aac8cd48e8e326b2231771b4e1c2e49a77597e508b36ec0c7d91ff6999cbe",
+  "test_csv_sha256": "16eb3372065d3c6e0dbef831d32cab335dfd2647b7ee70acac10fb0c845ea193"
+}

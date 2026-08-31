@@ -1,0 +1,7 @@
+{
+  "accuracy": 0.895,
+  "auc": 0.9490503466988242,
+  "log_loss": 0.30367087937908804,
+  "train_time_sec": 0.2784,
+  "predict_time_sec": 0.0067
+}
