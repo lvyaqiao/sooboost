@@ -34,6 +34,7 @@
 
 - 2026-08-31：现状审计 + 立项 M4-M6（转向「可用库」优先）。审计发现源码此前完全未进 git（仅文档提交）、集成测试在干净环境下 5/5 target 挂（benchmark 路径解析错）、risks/shared 台账空；决策优先级从「功能/研究扩张」反转为「可验证 + 可发布 + 被使用」。详情见「后续路线图」。
 - 2026-08-31：**M4 地基修复完成**：① 集成测试 `benchmark_path` 改为向上查找 workspace 根（解析到 `benchmark/`），5 个 integration target 转绿，全工作区 ~93 测试全绿（47 lib + 41 integration + 8 experiments）；② `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` 全绿；③ 5 处悬空 `doc/plans/m0-spec.md` 引用修正为 `doc/archive/m0-spec.md`；④ benchmark 门禁 `sooboost --gate`/`gen --gate` 本地复验全绿（sooboost 质量对标 sklearn HGB，4/4 数据集差 ≤0.05）；⑤ risks/shared 空台账改为种子登记。CI 八步（fmt/clippy/test/build/两门禁）本地复验全绿，**推送 master 后 GitHub Actions 将实际运行**。能力审计发现：早停/交叉验证**尚未实现**（M0 明确不做，属 M5/M6 硬化项），CLI 与核心 API 已可用。
+- 2026-09-01：**M5 过半**——① 新增 `sooboost-core/src/api.rs` 公共门面：`GradientBoosting::regressor()/classifier()` builder、扁平化 `Config`、`Objective` 枚举、统一 `Error`（收敛 Data/Boosting/Model/Io 四套错误为单一枚举）、`predict_row` 单行在线推断、`to_bytes/from_bytes/save/load`（载入时依据 contracts §1.2 的校验顺序——checksum 先于损失名——安全自动探测目标）；`Booster::learning_rate()` 由 crate 内提升为公开访问器，供门面回填配置；门面 12 项单测（含存读逐位一致、目标探测、非法参数拦截、篡改字节必报错）。② 端到端 example `california_housing`（读 CSV → 训练 → 预测 → R²/MAE → 存盘载入复核 → 单行预测），release 下 **R² 0.8404**（200 轮/lr 0.1，16,512×8，训练 1.08s），已超过基准金标准 sklearn HGB 的 0.8355。③ 根 `README.md` + crates.io 发布元数据（description/repository/keywords/categories/readme），`cargo package` 实测通过且 README 被正规化打入包内。④ 全量门禁复验：106 测试（59 单测 + 38 集成 + 8 实验 + 1 doctest）、`cargo fmt --check` 与 `clippy --all-targets -D warnings` 全绿、sooboost/gen 两门禁全绿。**未完成**：对标 XGBoost/LightGBM/CatBoost（目前**只对标了 sklearn HGB**，README 已如实标注此边界，不宣称达到三巨头水平）；crates.io 0.1.0 发布（待推送远程后执行）。
 
 ## 后续路线图（M4 起，2026-08-31 立项）
 
@@ -42,7 +43,7 @@
 | 里程碑 | 内容 | 状态 | 出口标准 |
 |---|---|---|---|
 | M4 | 地基修复：能力审计（实际 API/早停/CV 是否真实现）+ 集成测试转绿 + 全量提交 git + CI 真跑绿 + 修悬空文档引用 + 空台账改为种子登记 | 完成（2026-08-31，地基修复 + CI 八步本地复验全绿） | 干净 clone `cargo test` 在 CI 全绿；git 含源码 |
-| M5 | 可用库 v0.1：稳定公共 API 门面 + 端到端 example + 对标 XGBoost/LightGBM/CatBoost（≥3 真实集）+ 发布 crates.io 0.1.0 | 待立项 | `cargo add sooboost-core` 可用；example 能跑；基准报告存在 |
+| M5 | 可用库 v0.1：稳定公共 API 门面 + 端到端 example + 对标 XGBoost/LightGBM/CatBoost（≥3 真实集）+ 发布 crates.io 0.1.0 | 进行中（门面 + example + README + 发布元数据已完成；**对标三巨头与 crates.io 0.1.0 发布待办**） | `cargo add sooboost-core` 可用；example 能跑；基准报告存在 |
 | M6 | 硬化与差异化：早停 + CV + 多分类硬化/校准 + 特征重要度 + 真实基准固化进 CI 性能门禁 | 待立项 | 对标 LightGBM 标准集差距 ≤ 阈值；功能完备可用 |
 | 远期/支线 | WASM/C ABI/codegen、PG 插件、生产热替换；sooboost-experiments（条件分布树/Flow Matching）明确降级为支线，不占核心路线图进度 | 搁置（加日期） | 等 M5-M6 有真实用户后再启动 |
 

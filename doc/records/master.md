@@ -85,3 +85,29 @@
 **限制**：弱相关 synthetic 数据点填补仍略差于均值基线（约 `-7.7%` / `-10.8%`），门禁按无依赖场景允许不超过 `1.5x` 基线；生成结果仍属研究原型，不作为生产质量承诺。
 
 **待手动验收**：下一里程碑方向；M3 方案已归档至 `doc/archive/m3-forest-flow-quality.md`。
+
+### 2026-09-01 M5 阶段一交付：公共 API 门面 + 端到端 example + README
+
+**决策**：M4 能力审计确认核心算法已可用、但 API 需要用户自行拼装 `fit(ds, &params, loss, &ctx)` 四个概念且要面对三套独立错误类型。门面的定位是**收口而非替代**——底层 `fit` / `Booster<L>` / `Dataset` 保持一等公民，架构 D3 的 monomorphized `Loss`（编译期内联）不变，门面只压平「选目标 / 配参数 / 传上下文」并把错误收敛为单一枚举。此决策保证「好用」不以牺牲既有设计红线为代价。
+
+**动作**：
+- 新增 `sooboost-core/src/api.rs`（M5 门面层）：
+  - `Error`：统一枚举，收敛 `DataError` / `BoostingError` / `ModelError` / `io::Error`，并新增 `InvalidParam` / `FeatureCountMismatch` / `RowPredictUnsupportedWithCategorical` 三类门面专属错误；原始错误保留在变体内可 `source()` 下钻。
+  - `Objective`（`SquaredError` / `BinaryLogLoss`）+ 扁平 `Config`（不再要求用户知道 `max_depth` 属于分裂契约还是分箱契约）；`GradientBoosting::regressor() / classifier()` → builder → `fit`。
+  - `predict` / `raw_scores`（二分类下为 logit）/ `predict_row`（单行在线推断，缺失以 `f64::NAN` 表达并按 `MissingPolicy` 解释）。
+  - `to_bytes` / `from_bytes` / `save` / `load`：`from_bytes` 依据 contracts §1.2 的校验顺序（checksum 先于损失名校验）做目标自动探测——只有字节本身合法、仅目标不同才会落到 `LossMismatch`，截断/checksum 失败一律原样上抛（红线 6）。
+  - 入口参数校验：`n_estimators` / `learning_rate` / `min_samples_leaf` / `max_bins` / `max_categories` / `categorical_alpha` 非法时在 `fit` 前显式报错（NaN 也拦，易踩坑 5 静默错误纪律）。
+- `Booster::learning_rate()` 由 `pub(crate)` 提升为公开只读访问器，供门面在载入模型时回填持久化配置（`n_estimators` / `learning_rate` / `max_bins`）；树参数与 seed 不属于模型格式，载入后取默认值并已在文档注明。
+- 新增 `sooboost-core/examples/california_housing.rs`：完整回路（读 CSV → 训练 → 预测 → R²/MAE → 存盘载入复核 → 单行预测），数据路径沿用「从 `CARGO_MANIFEST_DIR` 向上查找含 `benchmark/` 的目录」，与集成测试同一思路，对 crate 嵌套深度不敏感。
+- 新增根 `README.md`（定位 / 快速开始 / 精度对标表 / 取舍 / 结构 / 开发命令 / 路线图指针）；`sooboost-core/Cargo.toml` 补 description / repository / homepage / documentation / keywords / categories / readme。
+
+**验证**：
+- `cargo test --workspace`：**106 测试全绿**（59 单测 + 38 集成 + 8 实验 + 1 doctest），其中门面新增 12 项（默认值对齐、线性拟合、概率区间、logit 一致性、存读逐位一致、目标探测、非法参数拦截、单行与批量一致、特征数不符、同 seed 同字节、错误统一、篡改字节必报错）。
+- `cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`：全绿（修掉 4 处告警：`neg_cmp_op_on_partial_ord` 改为显式 `is_finite` + 正比较、`needless_range_loop` 改迭代器、`type_complexity` 提 type alias）。
+- example（release）：california_housing **R² 0.8404 / MAE 30052**，200 轮 lr 0.1，训练 1.08s（16,512×8），存读后预测逐位一致。
+- `cargo package -p sooboost-core` 通过（49 文件），README 被正规化打入包内 `sooboost-core-0.1.0/README.md`。
+- benchmark：`sooboost --gate` / `gen --gate` 均 exit 0，4/4 数据集对标 sklearn HGB 差 ≤0.05。
+
+**限制**：当前精度基线**仅对标 sklearn `HistGradientBoosting`**，尚未对标 XGBoost / LightGBM / CatBoost；README 已如实标注此边界，不宣称达到三巨头水平。门面暂不覆盖多分类（`MulticlassBooster` 仍需直接调用）。
+
+**待手动验收**：M5 剩余项——对标 XGBoost/LightGBM/CatBoost（≥3 真实数据集）、推送远程触发真实 GitHub Actions、发布 crates.io 0.1.0。
