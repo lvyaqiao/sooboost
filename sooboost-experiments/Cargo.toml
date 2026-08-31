@@ -1,0 +1,12 @@
+[package]
+name = "sooboost-experiments"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "研究方向实验 crate（D7 风险隔离）：条件分布树 / Flow Matching 原型，验证后反哺核心"
+
+[dependencies]
+arrow = { version = "59.2.0", default-features = false }
+rand_xoshiro = "0.8.1"
+sooboost-core = { path = "../sooboost-core" }
+thiserror = "2.0.20"
