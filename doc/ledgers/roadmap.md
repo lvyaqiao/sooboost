@@ -4,7 +4,7 @@
 > 类型：T2 台账（权威单点）｜写者：维护者（状态权威）｜读者：全员（开工前必读状态总览）
 > 范围：里程碑/路线图/当前进度/排布原因——状态只在本文件变迁；需求源头见 doc/ledgers/backlog.md
 > 关联：doc/baseline/architecture.md §里程碑映射（源头，原 04 迁移）；doc/records/（交付与验收）；doc/ledgers/backlog.md（需求池）
-> 更新：2026-08-19（M3 质量硬化收口）
+> 更新：2026-08-31（审计现状 + 立项 M4-M6 转向「可用库」优先）
 
 ## 里程碑与路线图
 
@@ -31,6 +31,19 @@
 - 2026-08-19：**M2 收口**：M2-0 cargo-fuzz 双 target 各运行 ≥60s 无 crash（model 1086 万次、CSV 9.9 万次）；M2-A `sooboost-experiments` 完成 UnmaskingImputer + BaltoBot（均值/多峰条件分布测试）；M2-B 完成 per-feature ForestFlow（生成相关性/确定性/填补测试）；M2-C 验证现有 `Booster::predict_row` 足够，无需污染核心向量叶子设计；M2-D `benchmark --mode gen --gate` 接入 4 数据集，8 步 gate 全绿。
 - M2 生成门禁结论：4/4 数据集生成结果有限、相关性/C2ST 通过原型门槛；有强特征依赖时填补优于均值（binary +47.4%、California +40.9%），独立特征数据不强行要求超过均值，避免把无信号误判为算法回归。该结论仅代表研究原型，不代表生产质量承诺。
 - 2026-08-19：**M3 收口**：ForestFlow 加入经验分位数正态化、每行 4 个分层流匹配样本、二阶中点积分；新增 `impute_mean` 与可配置 `--imputation-samples`。生成/填补 gate 4/4 通过，California 生成均值相对误差 `1.027 → 0.049`、std 误差 `4.158 → 0.057`、C2ST `0.803 → 0.620`；点填补增益 `+23.3%`。
+
+- 2026-08-31：现状审计 + 立项 M4-M6（转向「可用库」优先）。审计发现源码此前完全未进 git（仅文档提交）、集成测试在干净环境下 5/5 target 挂（benchmark 路径解析错）、risks/shared 台账空；决策优先级从「功能/研究扩张」反转为「可验证 + 可发布 + 被使用」。详情见「后续路线图」。
+
+## 后续路线图（M4 起，2026-08-31 立项）
+
+> 立项背景：2026-08-31 现状审计发现——源码此前完全未进 git（仅文档提交）、集成测试在干净环境下 5/5 target 挂（benchmark 路径解析错误）、risks/shared 台账为空。决策：**优先级从「功能/研究扩张」反转为「可验证 + 可发布 + 被使用」**，先把现有成果变成可信、可发布的库，再谈扩张。
+
+| 里程碑 | 内容 | 状态 | 出口标准 |
+|---|---|---|---|
+| M4 | 地基修复：能力审计（实际 API/早停/CV 是否真实现）+ 集成测试转绿 + 全量提交 git + CI 真跑绿 + 修悬空文档引用 + 删空台账 | 进行中 | 干净 clone `cargo test` 在 CI 全绿；git 含源码 |
+| M5 | 可用库 v0.1：稳定公共 API 门面 + 端到端 example + 对标 XGBoost/LightGBM/CatBoost（≥3 真实集）+ 发布 crates.io 0.1.0 | 待立项 | `cargo add sooboost-core` 可用；example 能跑；基准报告存在 |
+| M6 | 硬化与差异化：早停 + CV + 多分类硬化/校准 + 特征重要度 + 真实基准固化进 CI 性能门禁 | 待立项 | 对标 LightGBM 标准集差距 ≤ 阈值；功能完备可用 |
+| 远期/支线 | WASM/C ABI/codegen、PG 插件、生产热替换；sooboost-experiments（条件分布树/Flow Matching）明确降级为支线，不占核心路线图进度 | 搁置（加日期） | 等 M5-M6 有真实用户后再启动 |
 
 ## 排布原因
 
