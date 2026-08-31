@@ -8,6 +8,7 @@
 // 将来引入 SIMD/零拷贝边界时改为 deny(unsafe_op_in_unsafe_fn) + 逐处审查注释。
 #![forbid(unsafe_code)]
 
+pub mod api;
 pub mod binning;
 pub mod boosting;
 pub mod data;

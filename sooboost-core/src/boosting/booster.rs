@@ -70,7 +70,8 @@ impl<L: Loss> Booster<L> {
         &self.trees
     }
 
-    pub(crate) fn learning_rate(&self) -> f64 {
+    /// 训练时的学习率（模型格式持久化字段，contracts §1.2；门面 `api` 回填配置用）。
+    pub fn learning_rate(&self) -> f64 {
         self.learning_rate
     }
 
