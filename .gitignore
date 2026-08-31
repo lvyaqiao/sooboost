@@ -2,6 +2,22 @@
 reference/
 papers/
 
+# Rust 构建产物（含 fuzz 子构建）
+target/
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/
+
+# 锁文件：本仓含可发布二进制(sooboost-cli)且计划上 crates.io，纳入版本管理
+# （原 Cargo.lock 忽略行已移除，2026-08-31）
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地工具/代理数据（WorkBuddy 项目记忆等，不入仓）
+.workbuddy/
+
 # 通用忽略
 .DS_Store
 Thumbs.db
