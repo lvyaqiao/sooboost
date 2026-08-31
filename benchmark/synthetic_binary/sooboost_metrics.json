@@ -2,5 +2,5 @@
   "accuracy": 0.9075,
   "auc": 0.9478193146417445,
   "log_loss": 0.29586637840279906,
-  "total_time_sec": 0.2784
+  "total_time_sec": 3.3649
 }

@@ -6,7 +6,7 @@
   "correlation_mae": 0.06118377948131418,
   "real_offdiag_abs_corr": 0.044975173662013555,
   "generated_offdiag_abs_corr": 0.04814470588887002,
-  "c2st_auc": 0.5862499999999999,
+  "c2st_auc": 0.5847222222222223,
   "imputation_feature": 3,
   "max_train_pair_abs_corr": 0.04767624088286682,
   "imputation_rmse": 1.177415424355475,
