@@ -7,9 +7,18 @@ use sooboost_core::binning::{BinTable, DEFAULT_MAX_BINS, MISSING_BIN};
 use sooboost_core::data::{Dataset, MissingPolicy};
 
 fn benchmark_path(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../")
-        .join(rel)
+    // Resolve the workspace root by walking up from CARGO_MANIFEST_DIR
+    // until we find the directory that owns `benchmark/`. This is robust to
+    // crate nesting depth and works on a clean clone (CI) without relying on
+    // the crate being exactly one level below the workspace root.
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    while let Some(parent) = dir.parent() {
+        if parent.join("benchmark").is_dir() {
+            return parent.join(rel);
+        }
+        dir = parent.to_path_buf();
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
 fn load(name: &str) -> Dataset {

@@ -18,9 +18,18 @@ const SYNTH_REG_TRAIN: &str = "benchmark/synthetic_regression/train.csv";
 const SYNTH_BIN_TRAIN: &str = "benchmark/synthetic_binary/train.csv";
 
 fn benchmark_path(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../")
-        .join(rel)
+    // Resolve the workspace root by walking up from CARGO_MANIFEST_DIR
+    // until we find the directory that owns `benchmark/`. Robust to crate
+    // nesting depth and works on a clean clone (CI) without assuming the
+    // crate is exactly one level below the workspace root.
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    while let Some(parent) = dir.parent() {
+        if parent.join("benchmark").is_dir() {
+            return parent.join(rel);
+        }
+        dir = parent.to_path_buf();
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
 fn load(rel: &str) -> Dataset {

@@ -1,6 +1,6 @@
 //! 数据集：arrow RecordBatch 零拷贝视图（架构 D1）。
 //!
-//! M0 范围（doc/plans/m0-spec.md §3）：数值特征 + 单个数值 target；
+//! M0 范围（doc/archive/m0-spec.md §3）：数值特征 + 单个数值 target；
 //! 缺失值语义一律经本模块查询（红线 2 唯一定义点）。
 
 use std::io::Cursor;

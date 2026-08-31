@@ -1,6 +1,6 @@
 //! 训练层：GBDT 提升循环与训练产物（架构 分层中的「训练层」）。
 //!
-//! M0 范围（doc/plans/m0-spec.md §2 承诺 4/5/8/9）：
+//! M0 范围（doc/archive/m0-spec.md §2 承诺 4/5/8/9）：
 //! - 仅内置 L2（SquaredError）与 binary logloss（BinaryLogLoss）两种损失；
 //! - `fit`：分箱 → init 偏置 → 迭代「梯度/海森 → 建树 → 学习率累加」；
 //! - `TrainingContext`：显式传递的运行时状态载体（红线 4，零全局状态）；
