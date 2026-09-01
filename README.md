@@ -4,8 +4,8 @@
 
 > **状态：[crates.io 0.2.0 已发布](https://crates.io/crates/sooboost-core)。**
 > 核心算法（分箱 / 直方图 / 建树 / 提升 / 类别特征 / 序列化）已完整可用并通过 CI 门禁；
-> M6 硬化与 M7 校准已收口：早停（标量 + 多分类）/ 交叉验证 / 特征重要度 / softmax 多分类 /
-> 温度缩放校准全部落地，真实数据集精度下限已固化为 CI 性能门禁。
+> M6–M8 已收口：早停（标量 + 多分类）/ 交叉验证 / 特征重要度 / softmax 多分类 /
+> 多分类类别特征 / 温度缩放校准全部落地，真实数据集精度下限已固化为 CI 性能门禁。
 > 注意：模型格式为 v4，0.1.x 导出的模型文件需重新训练。
 > 生产使用请自行评估。
 
@@ -90,12 +90,15 @@ model.feature_importances(ImportanceKind::Gain);       // 跨全部类别聚合
 let t = model.calibrate_temperature(&calib_ds)?;       // 完全确定（网格 + 黄金分割）
 let calibrated = model.predict_proba_with_temperature(&test, t)?;  // softmax(logits/T)
 
+// 类别特征（M8）：ordered TS 数值化，与标量模型同一管线、同一防泄漏纪律
+// 编码随模型序列化，load 后对 OOV 类别自动走先验；单行 predict_row 不支持类别模型
+
 // 序列化与目标自动探测与标量模型完全一致：save / load / from_bytes
 model.save("model.sbm")?;
 let loaded = GradientBoosting::load("model.sbm")?;     // 自动探测出多分类目标
 ```
 
-多分类暂不支持类别特征（显式报错，不静默降级）；交叉验证指标自动用 accuracy。
+交叉验证指标自动用 accuracy。
 温度 T 不写入模型格式，由调用方持有后传入 `predict_proba_with_temperature`。
 
 CLI 同样支持：`--eval <valid.csv> --early-stopping <rounds>`。
@@ -201,7 +204,8 @@ python benchmark/run_benchmark.py --mode gen --gate
 - **M5 可用库 v0.1**（已完成）：公共 API 门面 ✅、端到端示例 ✅、对标三巨头 ✅、发布 crates.io 0.1.0
 - **M6 硬化与差异化**（已完成）：早停 ✅、交叉验证 ✅、特征重要度 ✅（gain/cover/frequency）、softmax 多分类 ✅（模型格式 v4）、真实基准固化进 CI 性能门禁 ✅
 - **M7 多分类质量收口**（已完成）：多分类早停 ✅（验证 logloss 口径，语义与标量一致）、温度缩放校准 ✅（post-hoc 确定性搜索，T 不入模型格式）
-- **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换、多分类类别特征
+- **M8 多分类类别特征**（已完成）：ordered TS 复用标量 D9 管线 ✅（标签均值口径）、编码段随 v4 格式序列化 ✅（零格式变更）、OOV → 先验
+- **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换、per-class TS（CatBoost 式每类统计量）
 
 ---
 

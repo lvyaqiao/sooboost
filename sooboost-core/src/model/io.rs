@@ -57,7 +57,7 @@ pub fn serialize<L: Loss>(booster: &Booster<L>) -> Vec<u8> {
 /// 序列化多分类模型（v4 多分类路；M6-5a）。
 ///
 /// 树按类主序平铺（`trees[0][0..n], trees[1][0..n], …`），每类 init score
-/// 依次写入；多分类暂不支持类别特征，`has_categorical` 恒为 0。
+/// 依次写入；类别编码段（M8 起）与标量模型同布局。
 pub fn serialize_multiclass(booster: &MulticlassBooster) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -72,7 +72,28 @@ pub fn serialize_multiclass(booster: &MulticlassBooster) -> Vec<u8> {
     let trees: Vec<Tree> = booster.trees_flat().cloned().collect();
     let table = booster.bin_table();
     write_trees_and_tail(&mut out, &trees, table, |out| {
-        push_u8(out, 0); // 多分类暂不支持类别特征
+        // 类别编码段（v2 布局；M8 起多分类同样可能携带）
+        match booster.categorical_encoding() {
+            None => push_u8(out, 0),
+            Some(enc) => {
+                push_u8(out, 1);
+                let cat = booster.cat_features();
+                push_u32(out, cat.len() as u32);
+                for &f in cat {
+                    push_u32(out, f as u32);
+                }
+                for fi in 0..enc.num_features() {
+                    let entries = enc.entries(fi); // 按 key 升序，确定性
+                    push_u32(out, entries.len() as u32);
+                    for (k, v) in &entries {
+                        push_u32(out, *k);
+                        push_f64(out, *v);
+                    }
+                    push_f64(out, enc.prior(fi));
+                    push_f64(out, enc.alpha(fi));
+                }
+            }
+        }
     });
     out
 }
@@ -176,6 +197,7 @@ pub fn deserialize<L: Loss>(bytes: &[u8], loss: L) -> Result<Booster<L>, ModelEr
 ///
 /// 损失名必须为 `multiclass_softmax`，否则报 `LossMismatch`（门面探测据此
 /// 依次尝试标量 → 多分类）；树按类主序平铺还原，树数必须能被类别数整除。
+/// 类别编码段（M8 起）与标量模型同布局、同校验。
 pub fn deserialize_multiclass(bytes: &[u8]) -> Result<MulticlassBooster, ModelError> {
     let p = parse(bytes)?;
     if p.loss_name != MULTICLASS_LOSS_NAME {
@@ -196,11 +218,6 @@ pub fn deserialize_multiclass(bytes: &[u8]) -> Result<MulticlassBooster, ModelEr
     if !p.init_scores.iter().all(|s| s.is_finite()) || !p.learning_rate.is_finite() {
         return Err(ModelError::InvalidLayout("init/lr 非有限"));
     }
-    if p.has_categorical {
-        return Err(ModelError::InvalidLayout(
-            "多分类模型暂不支持类别特征段（has_categorical 必须为 0）",
-        ));
-    }
     validate_tree_features(&p.trees, p.table.num_features())?;
     let trees: Vec<Vec<Tree>> = p.trees.chunks(per_class).map(<[Tree]>::to_vec).collect();
     debug_assert_eq!(trees.len(), p.num_classes);
@@ -210,6 +227,8 @@ pub fn deserialize_multiclass(bytes: &[u8]) -> Result<MulticlassBooster, ModelEr
         p.table,
         p.init_scores,
         p.learning_rate,
+        p.encoding,
+        p.cat_features,
     ))
 }
 
@@ -221,10 +240,9 @@ struct Parsed {
     learning_rate: f64,
     trees: Vec<Tree>,
     table: BinTable,
-    /// 类别编码段（仅标量模型可能携带；多分类恒 None）。
+    /// 类别编码段（标量与多分类模型均可携带）。
     encoding: Option<CategoricalEncoding>,
     cat_features: Vec<usize>,
-    has_categorical: bool,
 }
 
 /// 共享解析：magic → 版本 → checksum → 头 → 树 → 分箱表 → 类别段 → 元数据。
@@ -274,11 +292,11 @@ fn parse(bytes: &[u8]) -> Result<Parsed, ModelError> {
 
     let table = read_bin_table(&mut c)?;
 
-    // 类别编码段（v2；标量模型可能携带，多分类序列化恒为 0）
+    // 类别编码段（v2；标量与多分类模型均可携带，M8）
     let mut encoding = None;
     let mut cat_features = Vec::new();
-    let has_categorical = match read_u8(&mut c)? {
-        0 => false,
+    match read_u8(&mut c)? {
+        0 => {}
         1 => {
             let num_cat = read_u32(&mut c)? as usize;
             for _ in 0..num_cat {
@@ -311,10 +329,9 @@ fn parse(bytes: &[u8]) -> Result<Parsed, ModelError> {
                 alphas.push(alpha);
             }
             encoding = Some(CategoricalEncoding::from_parts(maps, priors, alphas));
-            true
         }
         _ => return Err(ModelError::InvalidLayout("has_categorical 非 0/1")),
-    };
+    }
 
     let _metadata = read_len_str32(&mut c)?;
 
@@ -327,7 +344,6 @@ fn parse(bytes: &[u8]) -> Result<Parsed, ModelError> {
         table,
         encoding,
         cat_features,
-        has_categorical,
     })
 }
 

@@ -5,11 +5,16 @@
 //!
 //! 注意：与 `Booster<L>`（标量损失）分离；本类型自带训练与预测。
 
+use std::borrow::Cow;
+
 use arrow::array::{Array, Float64Array};
 
 use crate::binning::BinTable;
 use crate::boosting::booster::{EarlyStopping, ImportanceKind};
 use crate::data::missing::is_missing_value;
+use crate::data::target_stats::{
+    CategoricalEncoding, apply_encoding, compute_ordered_ts, resolve_to_dataset,
+};
 use crate::data::{DataError, Dataset, MissingPolicy};
 use crate::tree::{Tree, TreeBuilder, TreeParams};
 
@@ -27,6 +32,10 @@ pub struct MulticlassBooster {
     /// 每类初始 logit（类先验 log）。
     init_scores: Vec<f64>,
     learning_rate: f64,
+    /// 类别特征编码（M8：多分类复用 D9 ordered TS 管线；无类别时为 None）。
+    encoding: Option<CategoricalEncoding>,
+    /// 类别特征索引（与 encoding 同步存在）。
+    cat_features: Vec<usize>,
     /// 实际使用的每类轮数（早停回滚后可能小于请求的 n_estimators；M7-1）。
     best_iteration: usize,
     /// 验证集多分类 logloss 历史（每轮一个值；无早停训练为空；M7-1）。
@@ -68,6 +77,8 @@ impl MulticlassBooster {
         table: BinTable,
         init_scores: Vec<f64>,
         learning_rate: f64,
+        encoding: Option<CategoricalEncoding>,
+        cat_features: Vec<usize>,
     ) -> Self {
         let best_iteration = trees.first().map_or(0, Vec::len);
         Self {
@@ -76,8 +87,31 @@ impl MulticlassBooster {
             table,
             init_scores,
             learning_rate,
+            encoding,
+            cat_features,
             best_iteration,
             eval_history: Vec::new(),
+        }
+    }
+
+    /// 类别特征编码（有类别特征训练时存在，随模型序列化；M8）。
+    pub fn categorical_encoding(&self) -> Option<&CategoricalEncoding> {
+        self.encoding.as_ref()
+    }
+
+    /// 类别特征索引（与 encoding 同步存在；io 序列化用）。
+    pub(crate) fn cat_features(&self) -> &[usize] {
+        &self.cat_features
+    }
+
+    /// 解析推断集：类别特征经编码转数值（OOV → 先验）；无类别则原样借用。
+    fn resolve<'a>(&self, ds: &'a Dataset) -> Result<Cow<'a, Dataset>, BoostingError> {
+        if let Some(enc) = &self.encoding {
+            let resolved = apply_encoding(ds, enc, &self.cat_features)?;
+            let rd = resolve_to_dataset(ds, &resolved)?;
+            Ok(Cow::Owned(rd))
+        } else {
+            Ok(Cow::Borrowed(ds))
         }
     }
 
@@ -167,6 +201,8 @@ impl MulticlassBooster {
 
     /// 每行原始 logits（init + Σ lr·tree）。
     pub fn raw_logits(&self, ds: &Dataset) -> Result<Vec<Vec<f64>>, BoostingError> {
+        let resolved = self.resolve(ds)?;
+        let ds = resolved.as_ref();
         let n = ds.num_rows();
         let cols = feature_columns(ds)?;
         let policy = ds.missing_policy();
@@ -290,10 +326,7 @@ pub fn fit_multiclass(
     n_classes: usize,
     ctx: &TrainingContext,
 ) -> Result<MulticlassBooster, BoostingError> {
-    // ctx（seed 载体）当前仅标量 ordered TS 使用；多分类暂不支持类别特征，
-    // 保留参数以与标量 fit 契约对齐，红线 4 语义不变。
-    let _ = ctx;
-    fit_impl(ds, params, n_classes, None)
+    fit_impl(ds, params, n_classes, ctx, None)
 }
 
 /// 拟合多分类模型并启用早停（M7-1）。
@@ -308,14 +341,14 @@ pub fn fit_multiclass_with_early_stopping(
     ctx: &TrainingContext,
     early_stopping: &EarlyStopping,
 ) -> Result<MulticlassBooster, BoostingError> {
-    let _ = ctx;
-    fit_impl(ds, params, n_classes, Some(early_stopping))
+    fit_impl(ds, params, n_classes, ctx, Some(early_stopping))
 }
 
 fn fit_impl(
     ds: &Dataset,
     params: &BoostingParams,
     n_classes: usize,
+    ctx: &TrainingContext,
     early_stopping: Option<&EarlyStopping>,
 ) -> Result<MulticlassBooster, BoostingError> {
     if n_classes < 2 {
@@ -323,6 +356,31 @@ fn fit_impl(
             n_classes,
         )));
     }
+    // 类别特征 → ordered TS → 数值化解析数据集（M8，复用 D9 管线；统计量为标签均值）
+    let cat_features: Vec<usize> = (0..ds.num_features())
+        .filter(|&f| ds.feature_is_categorical(f))
+        .collect();
+    let (encoding, resolved_ds): (Option<CategoricalEncoding>, Cow<Dataset>) = if cat_features
+        .is_empty()
+    {
+        (None, Cow::Borrowed(ds))
+    } else {
+        for &f in &cat_features {
+            if let Some(len) = ds.categorical_dictionary_len(f)?
+                && len > params.max_categories
+            {
+                return Err(BoostingError::Data(DataError::TooManyCategories {
+                    name: ds.feature_names()[f].clone(),
+                    got: len,
+                    limit: params.max_categories,
+                }));
+            }
+        }
+        let (resolved, enc) = compute_ordered_ts(ds, &cat_features, params.categorical_alpha, ctx)?;
+        let rd = resolve_to_dataset(ds, &resolved)?;
+        (Some(enc), Cow::Owned(rd))
+    };
+    let ds = resolved_ds.as_ref();
     let n = ds.num_rows();
     let y: Vec<f64> = ds.target_values().values().to_vec();
     let labels = to_labels(&y, n_classes)?;
@@ -345,16 +403,24 @@ fn fit_impl(
                     eval: es.eval_set.num_features(),
                 });
             }
-            let eval_y: Vec<f64> = es.eval_set.target_values().values().to_vec();
+            // 验证集类别特征用训练编码解析（与标量 fit_with_early_stopping 同语义）
+            let resolved_eval: Cow<Dataset> = match &encoding {
+                None => Cow::Borrowed(&es.eval_set),
+                Some(enc) => {
+                    let resolved = apply_encoding(&es.eval_set, enc, &cat_features)?;
+                    Cow::Owned(resolve_to_dataset(&es.eval_set, &resolved)?)
+                }
+            };
+            let eval_y: Vec<f64> = resolved_eval.target_values().values().to_vec();
             let eval_labels = to_labels(&eval_y, n_classes)?;
-            let mut eval_cols_owned = Vec::with_capacity(es.eval_set.num_features());
-            for f in 0..es.eval_set.num_features() {
-                eval_cols_owned.push(es.eval_set.feature_values(f)?.clone());
+            let mut eval_cols_owned = Vec::with_capacity(resolved_eval.num_features());
+            for f in 0..resolved_eval.num_features() {
+                eval_cols_owned.push(resolved_eval.feature_values(f)?.clone());
             }
             Some(EvalState {
                 labels: eval_labels,
                 cols: eval_cols_owned,
-                policy: es.eval_set.missing_policy(),
+                policy: resolved_eval.missing_policy(),
             })
         }
     };
@@ -462,6 +528,8 @@ fn fit_impl(
         table,
         init_scores,
         learning_rate: params.learning_rate,
+        encoding,
+        cat_features,
         best_iteration,
         eval_history,
     })

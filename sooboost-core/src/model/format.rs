@@ -25,7 +25,7 @@
 //! max_bins         u32
 //! num_features     u32
 //! features×{ num_boundaries u32；boundaries [f64;num_boundaries] }
-//! has_categorical  u8（v2；0/1；多分类序列化恒为 0，暂不支持类别特征）
+//! has_categorical  u8（v2；0/1；标量与多分类均可携带类别编码段，M8 起多分类不再恒 0）
 //! [若 1] num_cat u32；cat_features [u32;num_cat]
 //!        每类别特征×{ num_entries u32；entries [u32 key, f64 value]（按 key 升序）
 //!                     prior f64；alpha f64 }

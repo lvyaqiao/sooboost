@@ -279,7 +279,7 @@ impl GradientBoosting {
     ///
     /// 每轮对每类建一棵树（共 `n_estimators × n_classes` 棵）；`y` 必须为
     /// 整数标签 ∈ [0, n_classes)，非整数或越界在 `fit` 时显式报错。
-    /// 多分类暂不支持类别特征与早停（显式报错，不静默降级）。
+    /// 类别特征（M8，ordered TS 标签均值口径）与早停（M7-1）均已支持。
     #[must_use]
     pub fn multiclass_classifier(n_classes: usize) -> GradientBoostingBuilder {
         GradientBoostingBuilder::new_multiclass(n_classes)
@@ -476,7 +476,7 @@ impl GradientBoosting {
         let has_categorical = match &self.fitted {
             Fitted::Regression(b) => b.categorical_encoding().is_some(),
             Fitted::Binary(b) => b.categorical_encoding().is_some(),
-            Fitted::Multiclass(_) => false,
+            Fitted::Multiclass(m) => m.categorical_encoding().is_some(),
         };
         if has_categorical {
             return Err(Error::RowPredictUnsupportedWithCategorical);
@@ -833,8 +833,8 @@ pub struct CvResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Float64Array;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::array::{DictionaryArray, Float64Array, StringArray, UInt32Array};
+    use arrow::datatypes::{DataType, Field, Schema, UInt32Type};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
@@ -1341,6 +1341,57 @@ mod tests {
         dataset(x, y)
     }
 
+    /// 类别列构造（M8 多分类类别特征测试用）：a→0, b→1, c→2 强信号。
+    fn multiclass_categorical_data(cats: Vec<Option<&str>>) -> Dataset {
+        let n = cats.len();
+        let uniq: Vec<&str> = {
+            let mut u: Vec<&str> = Vec::new();
+            for v in cats.iter().flatten() {
+                if !u.contains(v) {
+                    u.push(v);
+                }
+            }
+            u
+        };
+        let dict = StringArray::from(uniq.clone());
+        let keys: UInt32Array = cats
+            .iter()
+            .map(|v| v.map(|s| uniq.iter().position(|u| *u == s).expect("类别必须在字典中") as u32))
+            .collect();
+        let f0: Vec<f64> = (0..n).map(|i| (i % 7) as f64).collect();
+        let target: Vec<f64> = cats
+            .iter()
+            .map(|c| match c {
+                Some("a") => 0.0,
+                Some("b") => 1.0,
+                Some("c") => 2.0,
+                _ => 0.0,
+            })
+            .collect();
+        let schema = Schema::new(vec![
+            Field::new("f0", DataType::Float64, true),
+            Field::new(
+                "f1",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("target", DataType::Float64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Float64Array::from(f0)),
+                Arc::new(
+                    DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(dict)).expect("dict"),
+                ),
+                Arc::new(Float64Array::from(target)),
+            ],
+        )
+        .expect("构造类别测试 batch");
+        Dataset::from_record_batch(batch, &["f0", "f1"], "target", MissingPolicy::default())
+            .expect("构造类别 Dataset")
+    }
+
     #[test]
     fn multiclass_fits_separable_data() {
         let ds = three_class_data();
@@ -1641,6 +1692,90 @@ mod tests {
                 }
             ),
             "实际: {err}"
+        );
+    }
+
+    #[test]
+    fn multiclass_categorical_fit_predict_and_roundtrip() {
+        let mut cats: Vec<Option<&str>> = Vec::new();
+        for c in ["a", "b", "c"] {
+            for _ in 0..20 {
+                cats.push(Some(c));
+            }
+        }
+        let ds = multiclass_categorical_data(cats);
+        let model = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(30)
+            .learning_rate(0.3)
+            .seed(5)
+            .fit(&ds)
+            .expect("类别多分类训练成功");
+
+        // 类别强信号下训练集应全部分类正确
+        let classes = model.predict_classes(&ds).expect("类别预测成功");
+        for (&y, &c) in ds.target_values().values().iter().zip(&classes) {
+            assert_eq!(y as usize, c, "训练集类别 {y} 被错分为 {c}");
+        }
+
+        // OOV 推断集：新增 "zzz" 类别 → 先验，不崩溃、结果有限
+        let oov_ds =
+            multiclass_categorical_data(vec![Some("a"), Some("b"), Some("c"), Some("zzz"), None]);
+        let proba = model.predict_proba(&oov_ds).expect("OOV 预测成功");
+        assert_eq!(proba.len(), 5);
+        for row in &proba {
+            assert!(row.iter().all(|p| p.is_finite()), "OOV 概率应有限");
+            let s: f64 = row.iter().sum();
+            assert!((s - 1.0).abs() < 1e-9);
+        }
+
+        // 存读 roundtrip：预测逐位一致 + 再序列化字节一致
+        let bytes = model.to_bytes();
+        let reloaded = GradientBoosting::from_bytes(&bytes).expect("反序列化成功");
+        assert_eq!(reloaded.objective(), Objective::MulticlassSoftmax);
+        let before = model.predict_proba(&ds).expect("before");
+        let after = reloaded.predict_proba(&ds).expect("after");
+        for (a, b) in before.iter().zip(&after) {
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(x.to_bits(), y.to_bits(), "类别多分类 roundtrip 应逐位一致");
+            }
+        }
+        assert_eq!(bytes, reloaded.to_bytes());
+
+        // 类别模型的单行预测必须显式报错（`&[f64]` 承载不了类别键）
+        let err = model
+            .predict_row(&[1.0, 0.0])
+            .expect_err("类别多分类单行预测必须报错");
+        assert!(
+            matches!(err, Error::RowPredictUnsupportedWithCategorical),
+            "实际: {err}"
+        );
+    }
+
+    #[test]
+    fn multiclass_categorical_deterministic_same_seed() {
+        let mut cats: Vec<Option<&str>> = Vec::new();
+        for c in ["a", "b", "c"] {
+            for _ in 0..15 {
+                cats.push(Some(c));
+            }
+        }
+        let ds = multiclass_categorical_data(cats);
+        let m1 = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(20)
+            .learning_rate(0.3)
+            .seed(7)
+            .fit(&ds)
+            .expect("m1");
+        let m2 = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(20)
+            .learning_rate(0.3)
+            .seed(7)
+            .fit(&ds)
+            .expect("m2");
+        assert_eq!(
+            m1.to_bytes(),
+            m2.to_bytes(),
+            "同 seed → ordered TS 与模型逐位一致（红线 3）"
         );
     }
 

@@ -197,3 +197,26 @@
 **限制**：温度校准为 post-hoc 一维搜索，不改变 logits 本身；多分类仍不支持类别特征（显式报错）；早停回滚为整批树回滚（与标量一致，不做部分树裁剪）。
 
 **待手动验收**：无——CI 以 GitHub Actions 实跑为准。**M7 出口关闭（2026-09-01）**。下一里程碑未立项；候选：多分类类别特征（ordered TS 扩展到 K 类）、速度优化（SIMD/leaf-wise）、WASM/C ABI。
+
+### 2026-09-01 M8 交付：多分类类别特征（ordered TS 复用，模型格式零变更）
+
+**决策**：M7 后从远期清单捞起「多分类类别特征」立项 M8。核心判断：标量 D9 管线把类别特征经 ordered TS 数值化后完全复用数值建树管线，且 v4 格式的类别编码段布局与目标无关——因此多分类接入**不需要任何格式变更**，只需解除 M6 时「多分类路 has_categorical 恒 0」的自我限制。统计量取标签均值（整数标签的平滑 TS）：实现零成本且对类别→类的强信号可分；CatBoost 式 per-class 每类统计量需把一个类别特征扩成 K 列并扩展编码段布局，留远期并记入 roadmap。
+
+**动作**：
+- `multiclass.rs`：`fit_impl` 开头镜像标量的类别检测 + `max_categories` 校验 + `compute_ordered_ts`（ctx 的 seed 终于在多分类路生效——TS permutation 防泄漏）+ `resolve_to_dataset`；早停验证集用训练编码解析（OOV → 先验、null → 缺失）；`MulticlassBooster` 新增 `encoding`/`cat_features` 字段、`categorical_encoding()` 公开访问器、`resolve()` 推断集解析；`raw_logits` 先 resolve（`predict_proba`/`predict`/`predict_classes`/`calibrate_temperature` 自动受益）。
+- `io.rs`：`serialize_multiclass` 按标量同布局写编码段；`deserialize_multiclass` 解除 `has_categorical` 拒绝，`Parsed.has_categorical` 字段因失去唯一读者删除；`format.rs` 布局注释同步。
+- `api.rs`：`predict_row` 对类别多分类模型显式报错（`RowPredictUnsupportedWithCategorical`）；`multiclass_classifier` 文档更新（类别特征 M8 已支持）。
+- README：状态行（M6–M8）、多分类节补类别特征说明、路线图 M8 行。
+
+**验证**：
+- `cargo test --workspace`：**127 测试全绿**（新增 2 项）：
+  - `multiclass_categorical_fit_predict_and_roundtrip`：类别强信号（a/b/c→0/1/2）训练集全部分类正确；OOV 类别（"zzz"）与 null 类别推断不崩溃、概率有限且行和为 1；`to_bytes`/`from_bytes` roundtrip 预测逐位一致 + 再序列化字节一致 + 目标探测仍为 MulticlassSoftmax；`predict_row` 显式报错。
+  - `multiclass_categorical_deterministic_same_seed`：同 seed 两次训练序列化字节逐位一致（TS permutation 由 seed 派生，红线 3 在多分类类别路成立）。
+- fmt / clippy `--all-targets -D warnings` 干净。
+- 三道基准门禁全过：`run_real_gate.py`（0.8403 / 0.3877 / 0.9950）、`sooboost --gate`（对齐 HGB，差 -0.0068）、`gen --gate`。
+
+**限制**：TS 统计量为标签均值，弱于 CatBoost per-class 每类统计量（后者留远期）；`predict_row` 对类别模型不支持（`&[f64]` 承载不了类别键，标量同类模型同语义）。
+
+**计数校正**：M7 记录的「126 测试」实为 125（笔误多计 1）；本里程碑实测总数 127（80 lib + 38 integration + 8 experiments + 1 doctest）。
+
+**待手动验收**：无——CI 以 GitHub Actions 实跑为准。**M8 出口关闭（2026-09-01）**。下一里程碑未立项；候选：速度优化（SIMD/leaf-wise）、WASM/C ABI、crates.io 发版节奏随下一个用户可见功能再定。
