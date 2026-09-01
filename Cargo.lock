@@ -885,14 +885,14 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "sooboost-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sooboost-core",
 ]
 
 [[package]]
 name = "sooboost-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "arrow-csv",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "sooboost-experiments"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "rand_xoshiro",
