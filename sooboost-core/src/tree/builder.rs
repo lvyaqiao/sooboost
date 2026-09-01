@@ -142,8 +142,18 @@ impl TreeBuilder {
         let nf = matrix.num_features();
         let use_row_major = n / nf.max(1) >= ROW_MAJOR_MIN_ROWS_PER_FEATURE;
 
+        // M10 直方图减法状态（仅行主序路径使用）：
+        // - parent_info[li]：当前层第 li 个节点的 (父节点在上层 hists 的下标,
+        //   兄弟节点在本层的下标, 本节点是否为 seed)。seed = 直接构建的一方
+        //   （兄弟对中行数较小者，平局取左）；非 seed 由 父 − seed 推导。
+        // - prev_hists：上一层全部节点的直方图（按上层下标对齐，Option 供
+        //   推导子节点 take 接管）。
+        let mut parent_info: Vec<Option<(usize, usize, bool)>> = vec![None];
+        let mut prev_hists: Vec<Option<HistSet>> = Vec::new();
+
         while !level.is_empty() && depth < self.params.max_depth {
             let mut next_level: Vec<usize> = Vec::new();
+            let mut child_info: Vec<Option<(usize, usize, bool)>> = Vec::new();
             // 每节点区间 + 梯度合计（并行按节点；各节点行序固定 → 逐位一致）
             let ranges: Vec<(usize, usize)> = level.iter().map(|&id| nodes[id].range).collect();
             let totals: Vec<(f64, f64)> = ranges
@@ -159,11 +169,28 @@ impl TreeBuilder {
                 params: &self.params,
             };
 
-            let mut bests: Vec<Option<Split>> = if use_row_major {
-                // ── 行主序路径：阶段 A (节点×行块) 填充 + 阶段 B (节点×特征) 扫描 ──
-                // 块边界只依赖节点行数 → 与线程数无关（红线 3）
+            let mut bests: Vec<Option<Split>>;
+            let mut level_hists: Vec<HistSet> = Vec::new();
+            if use_row_major {
+                // ── 行主序路径（M10 直方图减法）──
+                // seed 节点（根节点，或兄弟对中行数较小者）直接按行块填充；
+                // 非 seed 节点 = 父直方图 − seed 兄弟直方图（填充量减半）。
+                // 三阶段各一次 join：填 seed → 推导非 seed → 全体扫描。
+                // 块边界/seed 选择只依赖行数 → 与线程数无关（红线 3）。
+                let is_seed: Vec<bool> = parent_info
+                    .iter()
+                    .map(|info| match info {
+                        None => true,
+                        Some((_, _, seed)) => *seed,
+                    })
+                    .collect();
+
+                // 阶段 A：填充 seed 节点，单元 = (seed 节点 × 行块)
                 let mut fill_units: Vec<(usize, usize, usize)> = Vec::new(); // (层内下标, 块起, 块止)
                 for (li, &(s, e)) in ranges.iter().enumerate() {
+                    if !is_seed[li] {
+                        continue;
+                    }
                     let len = e - s;
                     let mut off = 0;
                     while off < len {
@@ -189,11 +216,39 @@ impl TreeBuilder {
                         Some(acc) => acc.merge_in_place(&hs),
                     }
                 }
+
+                // 阶段 B：推导非 seed 节点 = 父 − seed 兄弟（单步减法，并行）。
+                // 父直方图恰好被其唯一的推导子节点**接管**（take，无克隆）——
+                // seed 子节点自建，兄弟对中只有一方需要父缓冲。
+                let derive_nodes: Vec<usize> =
+                    (0..ranges.len()).filter(|&li| !is_seed[li]).collect();
+                let payloads: Vec<(usize, HistSet)> = derive_nodes
+                    .iter()
+                    .map(|&li| {
+                        let (p, _, _) = parent_info[li].expect("非 seed 节点必有父信息");
+                        let ph = prev_hists[p]
+                            .take()
+                            .expect("父直方图恰被一个推导子节点接管");
+                        (li, ph)
+                    })
+                    .collect();
+                let derived: Vec<(usize, HistSet)> = payloads
+                    .into_par_iter()
+                    .map(|(li, mut h)| {
+                        let (_, sib, _) = parent_info[li].expect("非 seed 节点必有父信息");
+                        h.subtract_in_place(hists[sib].as_ref().expect("seed 兄弟直方图必已就绪"));
+                        (li, h)
+                    })
+                    .collect();
+                for (li, h) in derived {
+                    hists[li] = Some(h);
+                }
                 let hists: Vec<HistSet> = hists
                     .into_iter()
                     .map(|o| o.unwrap_or_else(|| HistSet::new(&num_bins)))
                     .collect();
 
+                // 阶段 C：分裂扫描，单元 = (节点 × 特征)
                 let mut scan_units: Vec<(usize, usize)> = Vec::new(); // (层内下标, 特征)
                 for li in 0..ranges.len() {
                     for f in 0..nf {
@@ -207,11 +262,12 @@ impl TreeBuilder {
                     })
                     .collect();
                 // 每节点按 (gain, feature) 全序合并（最大值唯一 → 与顺序无关）
-                let mut bests: Vec<Option<Split>> = vec![None; ranges.len()];
+                let mut bests_rm: Vec<Option<Split>> = vec![None; ranges.len()];
                 for (res, &(li, _)) in scan_results.into_iter().zip(&scan_units) {
-                    bests[li] = better_split(bests[li].take(), res);
+                    bests_rm[li] = better_split(bests_rm[li].take(), res);
                 }
-                bests
+                bests = bests_rm;
+                level_hists = hists;
             } else {
                 // ── 直接路径：单元 = (节点×特征)，独立填单特征直方图并扫描 ──
                 // 累加顺序与 v0.2.0 逐位一致；多特征小行数下特征维并行吃满核
@@ -227,12 +283,12 @@ impl TreeBuilder {
                         best_split_direct(&ctx, f, &rows[s..e], totals[li].0, totals[li].1)
                     })
                     .collect();
-                let mut bests: Vec<Option<Split>> = vec![None; ranges.len()];
+                let mut bests_direct: Vec<Option<Split>> = vec![None; ranges.len()];
                 for (res, &(li, _, _, _)) in results.into_iter().zip(&units) {
-                    bests[li] = better_split(bests[li].take(), res);
+                    bests_direct[li] = better_split(bests_direct[li].take(), res);
                 }
-                bests
-            };
+                bests = bests_direct;
+            }
 
             // 串行 bookkeeping + 原地分区（各节点区间不相交，顺序固定）
             for (level_idx, &node_id) in level.iter().enumerate() {
@@ -261,12 +317,25 @@ impl TreeBuilder {
                     node.left = Some(left_id);
                     node.right = Some(right_id);
                     node.gain = split.gain;
+                    // M10：为两个子节点登记 (父下标, 兄弟下标, 是否 seed)。
+                    // seed = 兄弟对中行数较小者（平局取左）→ 只构建一方，
+                    // 另一方由 父 − seed 推导（下一轮行主序路径使用）。
+                    if use_row_major {
+                        let left_pos = next_level.len();
+                        let left_seed = (m - s) <= (e - m);
+                        child_info.push(Some((level_idx, left_pos + 1, left_seed)));
+                        child_info.push(Some((level_idx, left_pos, !left_seed)));
+                    }
                     next_level.push(left_id);
                     next_level.push(right_id);
                 } else {
                     nodes[node_id].leaf_value =
                         Some(leaf_value(g_tot, h_tot, self.params.reg_lambda));
                 }
+            }
+            if use_row_major {
+                parent_info = child_info;
+                prev_hists = level_hists.into_iter().map(Some).collect();
             }
             level = next_level;
             depth += 1;

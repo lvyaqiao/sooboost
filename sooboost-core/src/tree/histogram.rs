@@ -92,6 +92,28 @@ impl HistSet {
         }
     }
 
+    /// 原地减法：`self = self − other`（M10 直方图减法：父 − seed 兄弟）。
+    ///
+    /// 行数上子节点 ⊆ 父节点 → count 差恒非负（用 saturating 防御）；
+    /// grad/hess 为单步浮点减法 → 结果与线程数无关（红线 3）。
+    pub fn subtract_in_place(&mut self, other: &HistSet) {
+        for (a, b) in self.grad.iter_mut().zip(&other.grad) {
+            *a -= b;
+        }
+        for (a, b) in self.hess.iter_mut().zip(&other.hess) {
+            *a -= b;
+        }
+        for (a, b) in self.count.iter_mut().zip(&other.count) {
+            *a = a.saturating_sub(*b);
+        }
+        for (a, b) in self.miss_g.iter_mut().zip(&other.miss_g) {
+            *a -= b;
+        }
+        for (a, b) in self.miss_h.iter_mut().zip(&other.miss_h) {
+            *a -= b;
+        }
+    }
+
     /// 某特征非缺失 (G, H, count) 合计（按 bin 下标顺序求和）。
     pub fn feature_total(&self, feature: usize) -> (f64, f64, u32) {
         let s = self.offsets[feature];
