@@ -38,7 +38,7 @@ use crate::boosting::booster::Booster;
 use crate::boosting::multiclass::MulticlassBooster;
 use crate::boosting::{
     BoostingError, BoostingParams, EarlyStopping, ImportanceKind, TrainingContext, fit,
-    fit_multiclass, fit_with_early_stopping,
+    fit_multiclass, fit_multiclass_with_early_stopping, fit_with_early_stopping,
 };
 use crate::data::missing::is_missing_value;
 use crate::data::{DataError, Dataset, MissingPolicy};
@@ -344,23 +344,24 @@ impl GradientBoosting {
     }
 
     /// 实际使用的提升轮数（早停回滚后可能小于请求的 n_estimators；
-    /// 多分类为每类轮数）。
+    /// 多分类为每类轮数，M7-1 起多分类早停同样生效）。
     #[must_use]
     pub fn best_iteration(&self) -> usize {
         match &self.fitted {
             Fitted::Regression(b) => b.best_iteration(),
             Fitted::Binary(b) => b.best_iteration(),
-            Fitted::Multiclass(m) => m.num_trees_per_class(),
+            Fitted::Multiclass(m) => m.best_iteration(),
         }
     }
 
     /// 早停验证集损失历史（每轮一个值；未启用早停则为空切片）。
+    /// 多分类的口径为验证集多分类 logloss（M7-1）。
     #[must_use]
     pub fn eval_history(&self) -> &[f64] {
         match &self.fitted {
             Fitted::Regression(b) => b.eval_history(),
             Fitted::Binary(b) => b.eval_history(),
-            Fitted::Multiclass(_) => &[],
+            Fitted::Multiclass(m) => m.eval_history(),
         }
     }
 
@@ -408,6 +409,37 @@ impl GradientBoosting {
             _ => Err(Error::UnsupportedForObjective {
                 operation: "raw_logits",
                 reason: "仅多分类模型输出 logits 矩阵；标量原始分数用 raw_scores",
+            }),
+        }
+    }
+
+    /// 温度缩放校准（M7-2）：在 `ds` 上求最小化 NLL 的温度 T（仅多分类）。
+    ///
+    /// 搜索完全确定（对数均匀粗网格 + 黄金分割细化，红线 3）；T 不写入模型
+    /// 格式，由调用方持有并传给 [`Self::predict_proba_with_temperature`]。
+    pub fn calibrate_temperature(&self, ds: &Dataset) -> Result<f64, Error> {
+        match &self.fitted {
+            Fitted::Multiclass(m) => Ok(m.calibrate_temperature(ds)?),
+            _ => Err(Error::UnsupportedForObjective {
+                operation: "calibrate_temperature",
+                reason: "温度缩放仅对多分类 softmax 有定义",
+            }),
+        }
+    }
+
+    /// 带温度的类别概率矩阵 `softmax(logits / T)`（M7-2；仅多分类）。
+    ///
+    /// `temperature` 必须为正的有限值；T=1 与 [`Self::predict_proba`] 恒等。
+    pub fn predict_proba_with_temperature(
+        &self,
+        ds: &Dataset,
+        temperature: f64,
+    ) -> Result<Vec<Vec<f64>>, Error> {
+        match &self.fitted {
+            Fitted::Multiclass(m) => Ok(m.predict_proba_with_temperature(ds, temperature)?),
+            _ => Err(Error::UnsupportedForObjective {
+                operation: "predict_proba_with_temperature",
+                reason: "温度缩放仅对多分类 softmax 有定义",
             }),
         }
     }
@@ -667,7 +699,7 @@ impl GradientBoostingBuilder {
     /// 树集合回滚到最优轮（见 [`GradientBoosting::best_iteration`] / `eval_history`）。
     ///
     /// 验证集特征数必须与训练集一致；类别特征用训练集学到的编码解析。
-    /// 暂不支持多分类（`multiclass_classifier` + 本方法在 `fit` 时显式报错）。
+    /// 多分类自 M7-1 起同样支持（口径为验证集多分类 logloss）。
     #[must_use]
     pub fn early_stopping(mut self, eval_set: Dataset, rounds: usize) -> Self {
         self.early_stopping = Some(EarlyStopping { eval_set, rounds });
@@ -697,13 +729,12 @@ impl GradientBoostingBuilder {
                         reason: "多分类至少需要 2 个类别",
                     });
                 }
-                if self.early_stopping.is_some() {
-                    return Err(Error::UnsupportedForObjective {
-                        operation: "early_stopping",
-                        reason: "多分类早停尚未实现（每轮需对全部类别联合评估 softmax 损失）",
-                    });
-                }
-                Fitted::Multiclass(fit_multiclass(ds, &params, n_classes, &ctx)?)
+                Fitted::Multiclass(match &self.early_stopping {
+                    None => fit_multiclass(ds, &params, n_classes, &ctx)?,
+                    Some(es) => {
+                        fit_multiclass_with_early_stopping(ds, &params, n_classes, &ctx, es)?
+                    }
+                })
             }
         };
         Ok(GradientBoosting::from_fitted(self.objective, fitted))
@@ -1452,25 +1483,160 @@ mod tests {
     }
 
     #[test]
-    fn multiclass_rejects_early_stopping_explicitly() {
-        let ds = three_class_data();
-        let (eval_x, eval_y): (Vec<f64>, Vec<f64>) = (0..99)
+    fn multiclass_early_stopping_stops_before_max_rounds() {
+        let train = three_class_data();
+        // 评估集用与训练正交的连续网格，标签按同一条则生成
+        let (eval_x, eval_y): (Vec<f64>, Vec<f64>) = (0..60)
             .map(|i| {
-                let x = i as f64;
-                (x, (x / 33.0).floor())
+                let x = i as f64 / 2.0;
+                (x, (x / 10.0).floor().min(2.0))
             })
             .unzip();
         let eval = dataset(eval_x, eval_y);
-        let err = GradientBoosting::multiclass_classifier(3)
-            .n_estimators(10)
-            .early_stopping(eval, 3)
-            .fit(&ds)
-            .expect_err("多分类早停必须显式报错");
+        let model = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(200)
+            .learning_rate(0.9)
+            .max_depth(6)
+            .seed(3)
+            .early_stopping(eval.clone(), 5)
+            .fit(&train)
+            .expect("训练成功");
+        // 门面 num_trees() 对多分类语义为「每类棵数」（与 n_estimators 对齐）
+        assert!(
+            model.num_trees() < 200,
+            "早停必须提前停止，实际每类树数 {}",
+            model.num_trees()
+        );
+        assert_eq!(model.best_iteration(), model.num_trees());
+        // 历史覆盖停止前的全部轮数（≥ 回滚后每类轮数）
+        assert!(model.eval_history().len() >= model.best_iteration());
+        // 最优轮即历史中的最小损失处
+        let best = model
+            .eval_history()
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .expect("历史非空");
+        assert_eq!(best + 1, model.best_iteration());
+
+        // 概率行和为 1
+        let proba = model.predict_proba(&eval).expect("概率预测成功");
+        for row in &proba {
+            let s: f64 = row.iter().sum();
+            assert!((s - 1.0).abs() < 1e-9, "概率行和应为 1，实际 {s}");
+        }
+
+        // 早停的真实价值断言：回滚模型在验证集上的 logloss 不劣于跑满 200 轮的模型
+        let y: Vec<usize> = eval
+            .target_values()
+            .values()
+            .iter()
+            .map(|&v| v as usize)
+            .collect();
+        let nll = |m: &GradientBoosting| -> f64 {
+            let p = m.predict_proba(&eval).expect("概率预测成功");
+            p.iter()
+                .zip(y.iter())
+                .map(|(row, &k)| -row[k].ln())
+                .sum::<f64>()
+                / y.len() as f64
+        };
+        let full = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(200)
+            .learning_rate(0.9)
+            .max_depth(6)
+            .seed(3)
+            .fit(&train)
+            .expect("全量训练成功");
+        assert!(
+            nll(&model) <= nll(&full) + 1e-9,
+            "早停验证 logloss {} 不应劣于全量 {}",
+            nll(&model),
+            nll(&full)
+        );
+    }
+
+    #[test]
+    fn temperature_calibration_is_deterministic_and_improves_nll() {
+        let train = three_class_data();
+        let (eval_x, eval_y): (Vec<f64>, Vec<f64>) = (0..60)
+            .map(|i| {
+                let x = i as f64 / 2.0;
+                (x, (x / 10.0).floor().min(2.0))
+            })
+            .unzip();
+        let eval = dataset(eval_x, eval_y);
+        let model = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(30)
+            .learning_rate(0.3)
+            .seed(11)
+            .fit(&train)
+            .expect("训练成功");
+
+        // 确定性：同一校准集两次结果完全一致
+        let t1 = model.calibrate_temperature(&eval).expect("校准成功");
+        let t2 = model.calibrate_temperature(&eval).expect("二次校准成功");
+        assert!(t1.is_finite() && t1 > 0.0, "温度应为正有限值，实际 {t1}");
+        assert_eq!(t1, t2, "校准必须完全确定（红线 3）");
+
+        // T=1 与 predict_proba 恒等
+        let base = model.predict_proba(&eval).expect("概率预测成功");
+        let at_one = model
+            .predict_proba_with_temperature(&eval, 1.0)
+            .expect("T=1 预测成功");
+        for (a, b) in base.iter().zip(at_one.iter()) {
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!((x - y).abs() < 1e-12, "T=1 必须与 predict_proba 恒等");
+            }
+        }
+
+        // 校准后 NLL 不劣于 T=1
+        let y: Vec<usize> = eval
+            .target_values()
+            .values()
+            .iter()
+            .map(|&v| v as usize)
+            .collect();
+        let nll_of = |p: &[Vec<f64>]| -> f64 {
+            p.iter()
+                .zip(y.iter())
+                .map(|(row, &k)| -row[k].ln())
+                .sum::<f64>()
+                / y.len() as f64
+        };
+        let calibrated = model
+            .predict_proba_with_temperature(&eval, t1)
+            .expect("校准预测成功");
+        assert!(
+            nll_of(&calibrated) <= nll_of(&base) + 1e-9,
+            "校准 NLL {} 不应劣于 T=1 NLL {}",
+            nll_of(&calibrated),
+            nll_of(&base)
+        );
+
+        // 非法温度报错
+        let err = model
+            .predict_proba_with_temperature(&eval, 0.0)
+            .expect_err("温度 0 必须报错");
+        assert!(
+            matches!(err, Error::Boosting(BoostingError::InvalidTemperature(_))),
+            "实际: {err}"
+        );
+
+        // 非多分类目标不支持温度缩放
+        let reg = GradientBoosting::regressor()
+            .n_estimators(5)
+            .fit(&train)
+            .expect("回归训练成功");
+        let err = reg
+            .calibrate_temperature(&eval)
+            .expect_err("回归目标必须报错");
         assert!(
             matches!(
                 err,
                 Error::UnsupportedForObjective {
-                    operation: "early_stopping",
+                    operation: "calibrate_temperature",
                     ..
                 }
             ),

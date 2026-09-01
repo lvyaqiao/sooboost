@@ -4,8 +4,9 @@
 
 > **状态：[crates.io 0.2.0 已发布](https://crates.io/crates/sooboost-core)。**
 > 核心算法（分箱 / 直方图 / 建树 / 提升 / 类别特征 / 序列化）已完整可用并通过 CI 门禁；
-> M6 硬化已收口：早停 / 交叉验证 / 特征重要度 / softmax 多分类全部落地，
-> 真实数据集精度下限已固化为 CI 性能门禁。注意：模型格式为 v4，0.1.x 导出的模型文件需重新训练。
+> M6 硬化与 M7 校准已收口：早停（标量 + 多分类）/ 交叉验证 / 特征重要度 / softmax 多分类 /
+> 温度缩放校准全部落地，真实数据集精度下限已固化为 CI 性能门禁。
+> 注意：模型格式为 v4，0.1.x 导出的模型文件需重新训练。
 > 生产使用请自行评估。
 
 ---
@@ -47,10 +48,10 @@ let reloaded = GradientBoosting::load("model.sbm")?;
 二分类把 `regressor()` 换成 `classifier()` 即可，`predict` 输出正类概率，
 `raw_scores` 输出 logit（供自定义阈值 / 校准）。
 
-### 早停 / 交叉验证 / 特征重要度（M6 已落地）
+### 早停 / 交叉验证 / 特征重要度（M6 已落地；早停自 M7 起也支持多分类）
 
 ```rust
-// 早停：连续 50 轮验证损失无改善即停，并回滚到最优轮
+// 早停：连续 50 轮验证损失无改善即停，并回滚到最优轮（回归 / 二分类 / 多分类通用）
 let model = GradientBoosting::regressor()
     .n_estimators(2000)
     .early_stopping(eval_ds, 50)   // 验证集 Dataset + patience
@@ -68,26 +69,34 @@ cv.mean; cv.std; cv.fold_scores;
 let imp = model.feature_importances(sooboost_core::boosting::ImportanceKind::Gain);
 ```
 
-### 多分类（softmax，M6 已落地）
+### 多分类（softmax，M6 已落地；早停与校准 M7 已落地）
 
 ```rust
 // 每轮每类一棵树；y 必须为整数标签 ∈ [0, n_classes)
 let model = GradientBoosting::multiclass_classifier(3)
     .n_estimators(200)
     .learning_rate(0.1)
+    .early_stopping(eval_ds, 50)      // M7-1：口径为验证集多分类 logloss
     .fit(&train)?;
+model.best_iteration();               // 早停回滚后每类实际轮数
+model.eval_history();                 // 每轮验证 logloss（学习曲线）
 
 let classes = model.predict_classes(&test)?;           // argmax 类别
 let proba = model.predict_proba(&test)?;               // [row][class]，softmax 行和为 1
 let logits = model.raw_logits(&test)?;                 // softmax 前的 logits（自定义校准用）
 model.feature_importances(ImportanceKind::Gain);       // 跨全部类别聚合
 
+// 温度缩放校准（M7-2）：在验证/校准集上求最小化 NLL 的温度 T
+let t = model.calibrate_temperature(&calib_ds)?;       // 完全确定（网格 + 黄金分割）
+let calibrated = model.predict_proba_with_temperature(&test, t)?;  // softmax(logits/T)
+
 // 序列化与目标自动探测与标量模型完全一致：save / load / from_bytes
 model.save("model.sbm")?;
 let loaded = GradientBoosting::load("model.sbm")?;     // 自动探测出多分类目标
 ```
 
-多分类暂不支持类别特征与早停（显式报错，不静默降级）；交叉验证指标自动用 accuracy。
+多分类暂不支持类别特征（显式报错，不静默降级）；交叉验证指标自动用 accuracy。
+温度 T 不写入模型格式，由调用方持有后传入 `predict_proba_with_temperature`。
 
 CLI 同样支持：`--eval <valid.csv> --early-stopping <rounds>`。
 
@@ -190,8 +199,9 @@ python benchmark/run_benchmark.py --mode gen --gate
 
 - **M4 地基修复**（已完成）：源码全量入 git、集成测试转绿、CI 门禁复验全绿
 - **M5 可用库 v0.1**（已完成）：公共 API 门面 ✅、端到端示例 ✅、对标三巨头 ✅、发布 crates.io 0.1.0
-- **M6 硬化与差异化**（已完成）：早停 ✅、交叉验证 ✅、特征重要度 ✅（gain/cover/frequency）、softmax 多分类 ✅（模型格式 v4）、真实基准固化进 CI 性能门禁 ✅；多分类校准与早停留远期
-- **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换、crates.io 0.2.0 发版
+- **M6 硬化与差异化**（已完成）：早停 ✅、交叉验证 ✅、特征重要度 ✅（gain/cover/frequency）、softmax 多分类 ✅（模型格式 v4）、真实基准固化进 CI 性能门禁 ✅
+- **M7 多分类质量收口**（已完成）：多分类早停 ✅（验证 logloss 口径，语义与标量一致）、温度缩放校准 ✅（post-hoc 确定性搜索，T 不入模型格式）
+- **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换、多分类类别特征
 
 ---
 

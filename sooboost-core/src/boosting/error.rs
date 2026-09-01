@@ -24,4 +24,7 @@ pub enum BoostingError {
     /// 早停参数非法（patience 为 0 会使第 2 轮必然停止）。
     #[error("早停参数非法: {0}")]
     InvalidEarlyStopping(&'static str),
+    /// 温度缩放参数非法（M7-2：温度必须为正的有限值）。
+    #[error("温度缩放参数非法: {0}（必须为正的有限值）")]
+    InvalidTemperature(f64),
 }

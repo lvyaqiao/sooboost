@@ -175,3 +175,25 @@
 **验证**：crates.io API 线上确认——version 3124213、num 0.2.0、yanked=false、crate_size 75,927B、37 个 Rust 文件/4,632 行、edition 2024、README 随包渲染。发布者 lvyaqiao。
 
 **意义**：M6 全部成果（早停/CV/特征重要度/softmax 多分类/模型格式 v4）随 0.2.0 可被 `cargo add sooboost-core@0.2.0` 使用；0.1.x 导出的模型文件需重训（v4 不读旧格式，README 已声明）。
+
+### 2026-09-01 M7 交付：多分类早停 + 温度缩放校准（M7 收口）
+
+**决策**：0.2.0 发布后从远期清单中捞起「多分类校准 + 多分类早停」立项 M7。两个设计原则：① 早停**完全镜像标量语义**——每轮在验证集评估多分类 logloss，patience 轮无改善即 break 并把树集合回滚到最优轮（`truncate(best_round + 1)`），不引入错误变体，与标量 `fit_with_early_stopping` 行为一致；② 温度 T **不写入模型格式**——post-hoc 校准参数由调用方持有并显式传入预测，避免为不入格式的派生量再做 v4→v5 破坏性 bump（0.2.0 用户零迁移成本）。
+
+**动作**：
+- `multiclass.rs` 重构训练入口：`fit_multiclass` / `fit_multiclass_with_early_stopping` 双入口收敛到共享 `fit_impl`（早停为 `Option<&EarlyStopping>`）。验证 logits 逐类列增量累加（每棵类树完成后只更新该类列），logloss = `-mean ln softmax(logits)[true]`，零额外前向遍历。入口校验：rounds==0 → `InvalidEarlyStopping`、空验证集 → `EmptyDataset`、特征数不符 → `EvalSetFeatureMismatch`、非法标签 → `InvalidClassLabel`。
+- `MulticlassBooster` 新增 `best_iteration()`（每类轮数，回滚后 < n_estimators）与 `eval_history()`（每轮验证 logloss，学习曲线）；`from_parts` 反序列化路径同步回填 `best_iteration`。
+- 温度缩放：`calibrate_temperature(ds)`——200 点对数均匀粗网格 ∈ [0.05, 20] + 黄金分割 80 迭代，**完全确定**（红线 3，无随机性）；`predict_proba_with_temperature(ds, t)` = `softmax(logits/T)`；非正/非有限温度 → 新增 `BoostingError::InvalidTemperature`。
+- 门面（api.rs）：`early_stopping` builder 对多分类生效（移除 M6 的 `UnsupportedForObjective` 拒绝路径）；`fit` 的 MulticlassSoftmax 分支按有无早停分派；`calibrate_temperature` / `predict_proba_with_temperature` 门面方法（非多分类 → `UnsupportedForObjective`）；`best_iteration()` / `eval_history()` 委托。
+- README：多分类节补早停与温度校准用法，早停节标注「三类目标通用」，路线图加 M7 行。
+
+**验证**：
+- `cargo test --workspace`：**126 测试全绿**（124 → 新增 2 项）：
+  - `multiclass_early_stopping_stops_before_max_rounds`：正交网格验证集 + patience 5，断言每类树数 < 200、`best_iteration == num_trees()`（门面 num_trees 对多分类语义为每类棵数，M6 起即如此）、历史最小值位置 +1 == best_iteration、概率行和为 1、**早停模型验证 NLL ≤ 全量 200 轮模型 + 1e-9**（早停的真实价值断言）。
+  - `temperature_calibration_is_deterministic_and_improves_nll`：两次校准 T 完全一致（红线 3）、T 为正有限、T=1 与 `predict_proba` 恒等（1e-12）、**校准后 NLL ≤ T=1 NLL + 1e-9**、温度 0.0 → `InvalidTemperature`、回归目标 → `UnsupportedForObjective { operation: "calibrate_temperature" }`。
+- fmt / clippy `--all-targets -D warnings` 干净。
+- 三道基准门禁全过：`run_real_gate.py`（0.8403 / 0.3877 / 0.9950）、`sooboost --gate`（对齐 HGB，差 -0.0068）、`gen --gate`。
+
+**限制**：温度校准为 post-hoc 一维搜索，不改变 logits 本身；多分类仍不支持类别特征（显式报错）；早停回滚为整批树回滚（与标量一致，不做部分树裁剪）。
+
+**待手动验收**：无——CI 以 GitHub Actions 实跑为准。**M7 出口关闭（2026-09-01）**。下一里程碑未立项；候选：多分类类别特征（ordered TS 扩展到 K 类）、速度优化（SIMD/leaf-wise）、WASM/C ABI。
