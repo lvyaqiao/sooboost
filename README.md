@@ -4,8 +4,9 @@
 
 > **状态：[crates.io 0.2.0 已发布](https://crates.io/crates/sooboost-core)。**
 > 核心算法（分箱 / 直方图 / 建树 / 提升 / 类别特征 / 序列化）已完整可用并通过 CI 门禁；
-> M6–M8 已收口：早停（标量 + 多分类）/ 交叉验证 / 特征重要度 / softmax 多分类 /
-> 多分类类别特征 / 温度缩放校准全部落地，真实数据集精度下限已固化为 CI 性能门禁。
+> M6–M9 已收口：早停（标量 + 多分类）/ 交叉验证 / 特征重要度 / softmax 多分类 /
+> 多分类类别特征 / 温度缩放校准全部落地，真实数据集精度下限已固化为 CI 性能门禁；
+> M9 建树热路径提速（同负载 A/B：california +16% / diabetes +13% / breast_cancer +34%，模型字节不变）。
 > 注意：模型格式为 v4，0.1.x 导出的模型文件需重新训练。
 > 生产使用请自行评估。
 
@@ -144,8 +145,8 @@ cargo run --release --example california_housing
 结论（如实说，不过度宣称）：sooboost 在三个真实集上**全部进入前二**——
 回归与分类质量与三巨头同一梯队（差距 <1%），小数据集上甚至超过 XGBoost / LightGBM；
 CatBoost 在小数据集上领先，归因于其有序提升等算法差异，不是工程问题。
-训练速度：快于 sklearn HGB 与 CatBoost，慢于 LightGBM / XGBoost（后者有多年的
-SIMD / leaf-wise 优化沉淀，这是 M6 性能门禁要追的方向）。
+训练速度：快于 sklearn HGB 与 CatBoost；相对 LightGBM / XGBoost 的差距经 M9 热路径
+改造（单趟直方图 + 形状自适应并行，模型字节不变）已收窄约 16–34%。
 
 ---
 
@@ -205,7 +206,8 @@ python benchmark/run_benchmark.py --mode gen --gate
 - **M6 硬化与差异化**（已完成）：早停 ✅、交叉验证 ✅、特征重要度 ✅（gain/cover/frequency）、softmax 多分类 ✅（模型格式 v4）、真实基准固化进 CI 性能门禁 ✅
 - **M7 多分类质量收口**（已完成）：多分类早停 ✅（验证 logloss 口径，语义与标量一致）、温度缩放校准 ✅（post-hoc 确定性搜索，T 不入模型格式）
 - **M8 多分类类别特征**（已完成）：ordered TS 复用标量 D9 管线 ✅（标签均值口径）、编码段随 v4 格式序列化 ✅（零格式变更）、OOV → 先验
-- **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换、per-class TS（CatBoost 式每类统计量）
+- **M9 速度优化**（已完成）：单趟直方图（每行只读一次 grad/hess）+ 形状自适应双路并行（行主序两阶段 / (节点×特征) 直接路径），任意线程数逐位一致，同负载 A/B 提速 16–34% 且模型字节不变
+- **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换、per-class TS（CatBoost 式每类统计量）、SIMD 内核（需 unsafe 或额外依赖，暂不做）
 
 ---
 

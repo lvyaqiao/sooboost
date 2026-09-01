@@ -7,10 +7,12 @@ use crate::data::dataset::Dataset;
 use super::bintable::{BinTable, MISSING_BIN, is_missing};
 use super::error::BinningError;
 
-/// 分箱后的训练矩阵（特征主序：`bins[feature * num_rows + row]`）。
+/// 分箱后的训练矩阵（行主序：`bins[row * num_features + feature]`，M9）。
 ///
-/// 只读缓存友好布局；本结构是 binning 的派生产物，不随模型序列化
-/// （模型只存 BinTable，训练/预测各自分箱）。
+/// 行主序使建树直方图的单趟行扫描对每一行连续读取全部特征的 bin id
+/// （约 2 行一条缓存线），并让 `grad[row]`/`hess[row]` 全程只读一次——
+/// 这是 M9 速度优化的关键布局。只读缓存友好；本结构是 binning 的派生
+/// 产物，不随模型序列化（模型只存 BinTable，训练/预测各自分箱）。
 #[derive(Debug, Clone)]
 pub struct BinnedMatrix {
     num_features: usize,
@@ -20,8 +22,16 @@ pub struct BinnedMatrix {
 
 impl BinnedMatrix {
     /// 第 `feature` 特征、第 `row` 行的 bin id（缺失值 = `MISSING_BIN`）。
+    #[inline]
     pub fn bin(&self, feature: usize, row: usize) -> u16 {
-        self.bins[feature * self.num_rows + row]
+        self.bins[row * self.num_features + feature]
+    }
+
+    /// 某行全部特征的 bin id（连续切片，行主序布局专属；M9）。
+    #[inline]
+    pub fn row_bins(&self, row: usize) -> &[u16] {
+        let base = row * self.num_features;
+        &self.bins[base..base + self.num_features]
     }
 
     pub fn num_features(&self) -> usize {
@@ -41,10 +51,9 @@ impl BinnedMatrix {
         let policy = ds.missing_policy();
         for f in 0..num_features {
             let vals = ds.feature_values(f)?;
-            let base = f * num_rows;
             for r in 0..num_rows {
                 let value = vals.value(r);
-                bins[base + r] = if is_missing(value, vals.is_null(r), policy) {
+                bins[r * num_features + f] = if is_missing(value, vals.is_null(r), policy) {
                     MISSING_BIN
                 } else {
                     table.bin_value(f, value)

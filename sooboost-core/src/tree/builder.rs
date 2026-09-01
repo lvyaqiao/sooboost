@@ -1,7 +1,21 @@
-//! TreeBuilder：level-wise 单线程直方图建树（红线 1 单一内核）。
+//! TreeBuilder：level-wise 建树 + 形状自适应并行（M9）。
 //!
-//! 算法：维护 `rows`（按节点区间 [s,e) 排列的行索引）与节点列表；
-//! 每层对每个活动节点构建直方图 → 找最佳分裂 → 原地分区生成子节点区间。
+//! 算法：维护 `rows`（按节点区间 [s,e) 排列的行索引）与节点列表；每层
+//! 并行求各节点 (G, H) 合计 → 并行求各节点最优分裂 → 串行 bookkeeping
+//! + 原地分区。分裂扫描按**数据形状**（行数/特征数）确定性二选一：
+//!
+//! - **行主序单趟（两阶段）**：并行单元 = (节点×行块) 填直方图 + (节点×特征)
+//!   扫描。每行只读一次 (grad, hess)，消除逐特征路径 F 倍重复读的内存
+//!   流量。适合大行数少特征（california 20000×8：A/B 实测快 ~9–30%）。
+//! - **直接路径**：并行单元 = (节点×特征)，每单元独立构建单特征直方图并
+//!   扫描，累加顺序与 v0.2.0 **逐位一致**。适合多特征小行数
+//!   （breast_cancer 569×30）——浅层节点少、特征多，特征维并行吃满核；
+//!   行主序路径在此形状实测反而慢 ~79%（浅层填充并行度塌缩）。
+//!
+//! 确定性（红线 3 层级二）：选路只依赖数据形状（与线程数无关）；
+//! 行块边界只依赖节点行数、块间按块下标定序归并；(gain, feature) 全序
+//! 合并与归约顺序无关 → **任意线程数逐位一致**。
+//!
 //! 分裂公式（牛顿步，对 L2 / binary logloss 通用）：
 //!   gain = 0.5·(G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ))
 //! 叶子值 = −G/(H+λ)。
@@ -11,8 +25,14 @@ use rayon::prelude::*;
 use crate::binning::{BinTable, BinnedMatrix, MISSING_BIN};
 
 use super::error::TreeError;
-use super::histogram::Histogram;
+use super::histogram::HistSet;
 use super::model::Tree;
+
+/// 直方图填充的行块大小：并行单元粒度（M9）。
+const FILL_CHUNK_ROWS: usize = 4096;
+
+/// 行主序单趟路径的形状门槛：平均每特征行数 ≥ 该值才启用（见模块文档）。
+const ROW_MAJOR_MIN_ROWS_PER_FEATURE: usize = 1024;
 
 /// 树参数（M0 首版固定，m0-spec §4）。
 #[derive(Debug, Clone, Copy)]
@@ -115,26 +135,113 @@ impl TreeBuilder {
         let mut level: Vec<usize> = vec![0];
         let mut depth = 0usize;
 
+        let num_bins: Vec<usize> = (0..matrix.num_features())
+            .map(|f| table.num_bins(f))
+            .collect();
+        // 形状自适应选路（只依赖数据形状 → 确定性；见模块文档）
+        let nf = matrix.num_features();
+        let use_row_major = n / nf.max(1) >= ROW_MAJOR_MIN_ROWS_PER_FEATURE;
+
         while !level.is_empty() && depth < self.params.max_depth {
             let mut next_level: Vec<usize> = Vec::new();
-            for &node_id in &level {
+            // 每节点区间 + 梯度合计（并行按节点；各节点行序固定 → 逐位一致）
+            let ranges: Vec<(usize, usize)> = level.iter().map(|&id| nodes[id].range).collect();
+            let totals: Vec<(f64, f64)> = ranges
+                .par_iter()
+                .map(|&(s, e)| sum_grad_hess(&rows[s..e], grad, hess))
+                .collect();
+
+            let ctx = ScanCtx {
+                matrix,
+                table,
+                grad,
+                hess,
+                params: &self.params,
+            };
+
+            let mut bests: Vec<Option<Split>> = if use_row_major {
+                // ── 行主序路径：阶段 A (节点×行块) 填充 + 阶段 B (节点×特征) 扫描 ──
+                // 块边界只依赖节点行数 → 与线程数无关（红线 3）
+                let mut fill_units: Vec<(usize, usize, usize)> = Vec::new(); // (层内下标, 块起, 块止)
+                for (li, &(s, e)) in ranges.iter().enumerate() {
+                    let len = e - s;
+                    let mut off = 0;
+                    while off < len {
+                        let end = usize::min(off + FILL_CHUNK_ROWS, len);
+                        fill_units.push((li, off, end));
+                        off = end;
+                    }
+                }
+                let partials: Vec<HistSet> = fill_units
+                    .par_iter()
+                    .map(|&(li, off, end)| {
+                        let (s, _) = ranges[li];
+                        let mut hs = HistSet::new(&num_bins);
+                        hs.fill(matrix, &rows[s + off..s + end], grad, hess);
+                        hs
+                    })
+                    .collect();
+                // 按节点依块下标定序归并（任意线程数结果一致）
+                let mut hists: Vec<Option<HistSet>> = (0..ranges.len()).map(|_| None).collect();
+                for (hs, &(li, _, _)) in partials.into_iter().zip(&fill_units) {
+                    match &mut hists[li] {
+                        None => hists[li] = Some(hs),
+                        Some(acc) => acc.merge_in_place(&hs),
+                    }
+                }
+                let hists: Vec<HistSet> = hists
+                    .into_iter()
+                    .map(|o| o.unwrap_or_else(|| HistSet::new(&num_bins)))
+                    .collect();
+
+                let mut scan_units: Vec<(usize, usize)> = Vec::new(); // (层内下标, 特征)
+                for li in 0..ranges.len() {
+                    for f in 0..nf {
+                        scan_units.push((li, f));
+                    }
+                }
+                let scan_results: Vec<Option<Split>> = scan_units
+                    .par_iter()
+                    .map(|&(li, f)| {
+                        best_split_for_feature(&ctx, f, &hists[li], totals[li].0, totals[li].1)
+                    })
+                    .collect();
+                // 每节点按 (gain, feature) 全序合并（最大值唯一 → 与顺序无关）
+                let mut bests: Vec<Option<Split>> = vec![None; ranges.len()];
+                for (res, &(li, _)) in scan_results.into_iter().zip(&scan_units) {
+                    bests[li] = better_split(bests[li].take(), res);
+                }
+                bests
+            } else {
+                // ── 直接路径：单元 = (节点×特征)，独立填单特征直方图并扫描 ──
+                // 累加顺序与 v0.2.0 逐位一致；多特征小行数下特征维并行吃满核
+                let mut units: Vec<(usize, usize, usize, usize)> = Vec::new(); // (层内下标, 特征, 区间起, 区间止)
+                for (li, &(s, e)) in ranges.iter().enumerate() {
+                    for f in 0..nf {
+                        units.push((li, f, s, e));
+                    }
+                }
+                let results: Vec<Option<Split>> = units
+                    .par_iter()
+                    .map(|&(li, f, s, e)| {
+                        best_split_direct(&ctx, f, &rows[s..e], totals[li].0, totals[li].1)
+                    })
+                    .collect();
+                let mut bests: Vec<Option<Split>> = vec![None; ranges.len()];
+                for (res, &(li, _, _, _)) in results.into_iter().zip(&units) {
+                    bests[li] = better_split(bests[li].take(), res);
+                }
+                bests
+            };
+
+            // 串行 bookkeeping + 原地分区（各节点区间不相交，顺序固定）
+            for (level_idx, &node_id) in level.iter().enumerate() {
                 let (s, e) = nodes[node_id].range;
-                let (g_tot, h_tot) = sum_grad_hess(&rows[s..e], grad, hess);
-
-                let best = find_best_split(
-                    &ScanCtx {
-                        matrix,
-                        table,
-                        grad,
-                        hess,
-                        params: &self.params,
-                    },
-                    &rows[s..e],
-                    g_tot,
-                    h_tot,
-                );
-
-                if let Some(split) = best.filter(|sp| sp.gain > self.params.min_split_gain) {
+                let (g_tot, h_tot) = totals[level_idx];
+                if let Some(split) = bests[level_idx]
+                    .take()
+                    .filter(|sp| sp.gain > self.params.min_split_gain)
+                {
                     let m = partition_rows(&mut rows, s, e, |r| {
                         let b = matrix.bin(split.feature, r);
                         if b == MISSING_BIN {
@@ -190,7 +297,7 @@ fn sum_grad_hess(node_rows: &[usize], grad: &[f64], hess: &[f64]) -> (f64, f64) 
     (g, h)
 }
 
-/// 扫描上下文：建树所需只读输入（避免 find_best_split 参数过多）。
+/// 扫描上下文：分裂扫描所需只读输入。
 struct ScanCtx<'a> {
     matrix: &'a BinnedMatrix,
     table: &'a BinTable,
@@ -199,16 +306,47 @@ struct ScanCtx<'a> {
     params: &'a TreeParams,
 }
 
-/// 对节点内所有特征扫描分裂点，返回最优分裂。
+/// 直接路径：单特征最优分裂（独立填单特征直方图 + 扫描；M9 (节点×特征) 并行单元）。
 ///
-/// 并行（M1-3，D2）：特征维度 `par_iter` 独立构建直方图，各特征无共享浮点
-/// 归约 → **任意线程数逐位一致**（红线 3 层级二）；合并用 (gain, feature) 全序
-/// 比较，reduce 顺序无关，结果唯一确定。
-fn find_best_split(ctx: &ScanCtx, node_rows: &[usize], g_tot: f64, h_tot: f64) -> Option<Split> {
-    (0..ctx.matrix.num_features())
-        .into_par_iter()
-        .map(|feature| best_split_for_feature(ctx, feature, node_rows, g_tot, h_tot))
-        .reduce(|| None, better_split)
+/// 逐行顺序累加（`matrix.bin(feature, r)` 特征主序连续读 bin），
+/// 与 v0.2.0 的逐特征处理**逐位一致**。
+fn best_split_direct(
+    ctx: &ScanCtx,
+    feature: usize,
+    node_rows: &[usize],
+    g_tot: f64,
+    h_tot: f64,
+) -> Option<Split> {
+    let num_bins = ctx.table.num_bins(feature);
+    if num_bins < 2 {
+        return None;
+    }
+    let mut grad = vec![0.0f64; num_bins];
+    let mut hess = vec![0.0f64; num_bins];
+    let mut count = vec![0u32; num_bins];
+    let (mut mg, mut mh) = (0.0f64, 0.0f64);
+    for &r in node_rows {
+        let b = ctx.matrix.bin(feature, r);
+        let (g, h) = (ctx.grad[r], ctx.hess[r]);
+        if b == MISSING_BIN {
+            mg += g;
+            mh += h;
+        } else {
+            grad[b as usize] += g;
+            hess[b as usize] += h;
+            count[b as usize] += 1;
+        }
+    }
+    let (g_nm, h_nm, c_nm): (f64, f64, u32) = {
+        let g: f64 = grad.iter().sum();
+        let h: f64 = hess.iter().sum();
+        let c: u32 = count.iter().sum();
+        (g, h, c)
+    };
+
+    scan_histogram(
+        ctx, feature, num_bins, &grad, &hess, &count, g_nm, h_nm, c_nm, mg, mh, g_tot, h_tot,
+    )
 }
 
 /// (gain, feature) 全序合并：增益大者胜；平局取特征号小者 → 结果与归约顺序无关。
@@ -225,11 +363,11 @@ fn better_split(a: Option<Split>, b: Option<Split>) -> Option<Split> {
     }
 }
 
-/// 单特征最优分裂（直方图构建 + 分位扫描；并行单元，内部顺序执行保证逐位确定）。
+/// 行主序路径：单特征最优分裂（扫描预建直方图；(节点×特征) 并行单元）。
 fn best_split_for_feature(
     ctx: &ScanCtx,
     feature: usize,
-    node_rows: &[usize],
+    hist: &HistSet,
     g_tot: f64,
     h_tot: f64,
 ) -> Option<Split> {
@@ -237,25 +375,46 @@ fn best_split_for_feature(
     if num_bins < 2 {
         return None;
     }
-    let mut hist = Histogram::new(num_bins);
-    let (mut mg, mut mh) = (0.0f64, 0.0f64);
-    for &r in node_rows {
-        let b = ctx.matrix.bin(feature, r);
-        if b == MISSING_BIN {
-            mg += ctx.grad[r];
-            mh += ctx.hess[r];
-        } else {
-            hist.accumulate(b, ctx.grad[r], ctx.hess[r]);
-        }
-    }
-    let (g_nm, h_nm, c_nm) = hist.total();
+    let (g_nm, h_nm, c_nm) = hist.feature_total(feature);
+    let (mg, mh) = (hist.miss_g[feature], hist.miss_h[feature]);
 
+    let s = hist.offsets[feature];
+    let grad = &hist.grad[s..s + num_bins];
+    let hess = &hist.hess[s..s + num_bins];
+    let count = &hist.count[s..s + num_bins];
+
+    scan_histogram(
+        ctx, feature, num_bins, grad, hess, count, g_nm, h_nm, c_nm, mg, mh, g_tot, h_tot,
+    )
+}
+
+/// 分位扫描共享内核：对单特征直方图做前缀累加并取最优分裂。
+///
+/// 两种缺失方向（随左/随右）取增益更大者；阈值取该 bin 上边界。
+/// 逐 bin 顺序扫描 → 结果确定。
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn scan_histogram(
+    ctx: &ScanCtx,
+    feature: usize,
+    num_bins: usize,
+    grad: &[f64],
+    hess: &[f64],
+    count: &[u32],
+    g_nm: f64,
+    h_nm: f64,
+    c_nm: u32,
+    mg: f64,
+    mh: f64,
+    g_tot: f64,
+    h_tot: f64,
+) -> Option<Split> {
     let mut best: Option<Split> = None;
     let (mut g_l, mut h_l, mut c_l) = (0.0f64, 0.0f64, 0u32);
     for k in 0..num_bins - 1 {
-        g_l += hist.grad[k];
-        h_l += hist.hess[k];
-        c_l += hist.count[k];
+        g_l += grad[k];
+        h_l += hess[k];
+        c_l += count[k];
         if (c_l as usize) < ctx.params.min_samples_leaf {
             continue;
         }
