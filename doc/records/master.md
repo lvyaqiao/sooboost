@@ -167,3 +167,11 @@
 **限制**：多分类不支持类别特征与早停（显式报错）；校准（温度缩放/Platt）未做；模型格式 v4 不读 v2/v3 旧文件（0.1.0 用户需重训）；速度差距（SIMD/leaf-wise）延续一期结论。
 
 **待手动验收**：无——CI 以 GitHub Actions 实跑为准（三道基准门禁已全部固化进 CI）。**M6 出口关闭（2026-09-01）**。下一里程碑未立项；候选：crates.io 0.2.0 发版（多分类 + v4 格式）、多分类校准、速度优化。
+
+### 2026-09-01 补充交付：crates.io 0.2.0 发布上线（多分类 + 模型格式 v4）
+
+**动作**：workspace 版本 0.1.0→0.2.0（仅 sooboost-core 发布，cli/experiments 保持 path 依赖）；`cargo publish --dry-run` 通过后正式上传；README 状态行与快速开始同步到 0.2.0。
+
+**验证**：crates.io API 线上确认——version 3124213、num 0.2.0、yanked=false、crate_size 75,927B、37 个 Rust 文件/4,632 行、edition 2024、README 随包渲染。发布者 lvyaqiao。
+
+**意义**：M6 全部成果（早停/CV/特征重要度/softmax 多分类/模型格式 v4）随 0.2.0 可被 `cargo add sooboost-core@0.2.0` 使用；0.1.x 导出的模型文件需重训（v4 不读旧格式，README 已声明）。

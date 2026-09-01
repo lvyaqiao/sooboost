@@ -56,3 +56,4 @@
 - **M0 风险最高前置**：验证 arrow 集成与 Loss trait 设计是否成立。
 - **M1 核心功能面**：D9 类别特征一期。
 - **M2 研究向集成**：实验 crate 原型验证后反哺核心（D7），风险隔离。
+- 2026-09-01（补5）：**crates.io 0.2.0 发布上线**。workspace 版本 0.1.0→0.2.0，`cargo publish -p sooboost-core` 成功并线上确认（version 3124213，yanked=false，37 文件/4,632 行 Rust，edition 2024，README 渲染）。M6 全部成果（早停/CV/特征重要度/softmax 多分类/模型格式 v4）正式对外可用；0.1.x 模型文件需重训（v4 不读旧格式）。M4-M6 保持全部完成状态。
