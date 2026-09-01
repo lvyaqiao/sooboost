@@ -17,6 +17,7 @@ __pycache__/
 
 # 三巨头对比脚本的临时工作目录（生成的 train/test CSV）
 benchmark/giants_work/
+benchmark/real_gate_work/
 
 # 本地工具/代理数据（WorkBuddy 项目记忆等，不入仓）
 .workbuddy/
