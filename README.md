@@ -4,9 +4,11 @@
 
 > **状态：[crates.io 0.2.0 已发布](https://crates.io/crates/sooboost-core)。**
 > 核心算法（分箱 / 直方图 / 建树 / 提升 / 类别特征 / 序列化）已完整可用并通过 CI 门禁；
-> M6–M10 已收口：早停（标量 + 多分类）/ 交叉验证 / 特征重要度 / softmax 多分类 /
+> M6–M12 已收口：早停（标量 + 多分类）/ 交叉验证 / 特征重要度 / softmax 多分类 /
 > 多分类类别特征 / 温度缩放校准全部落地，真实数据集精度下限已固化为 CI 性能门禁；
-> M9–M10 建树热路径提速（单趟直方图 + 形状自适应并行 + 直方图减法，模型字节不变）。
+> M9–M10 建树热路径提速（单趟直方图 + 形状自适应并行 + 直方图减法，模型字节不变）；
+> M12 C ABI 嵌入接口（`sooboost-ffi`，C/C++/Python(ctypes) 可直接训练 / 预测 / 序列化，
+> 头文件 `sooboost-ffi/include/sooboost.h`）。
 > 注意：模型格式为 v4，0.1.x 导出的模型文件需重新训练。
 > 生产使用请自行评估。
 
@@ -209,7 +211,9 @@ python benchmark/run_benchmark.py --mode gen --gate
 - **M9 速度优化**（已完成）：单趟直方图（每行只读一次 grad/hess）+ 形状自适应双路并行（行主序两阶段 / (节点×特征) 直接路径），任意线程数逐位一致，同负载 A/B 提速 16–34% 且模型字节不变
 - **M10 直方图减法**（已完成）：行主序路兄弟对只直接构建较小子节点的直方图，较大一方由 父−seed 推导（父缓冲接管，零克隆），填充量减半；单线程同轮 A/B california 中位数再快 27%，模型字节不变
 - **M11 扫描内核优化**（已评估，负结果）：feature_total 预存经同轮 A/B 实测为净回归（填充热循环开销 > 扫描节省），且行序合计会引发近平局分裂的 ulp 漂移——整体回退，`feature_total` O(bins) 向量化求和保留为最终形态
-- **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换、per-class TS（CatBoost 式每类统计量）、SIMD 内核（需 unsafe 或额外依赖，暂不做）
+- **M12 C ABI 嵌入接口**（已完成）：`sooboost-ffi`（cdylib）暴露稳定 `extern "C"`——`sbs_train`（JSON 参数 + 行主序数据，NaN=缺失）/ `sbs_predict` / `sbs_predict_proba` / 两段式序列化（与 Rust save/load 字节互通）/ 线程局部 last_error；FFI 与 Rust 门面同 seed 预测逐位一致；ctypes 冒烟接入 CI；头文件 `sooboost-ffi/include/sooboost.h`
+- **M13 内核级提速**（已立项待批）：填充热路径访存优化（缓存分块 → 布局/读放大 → EFB 评估），方案见 `doc/plans/m13-kernel-speedup.md`；算法结构方向（leaf-wise/bins/扫描侧）已经黑盒探针证伪排除
+- **远期 / 支线**（显式搁置）：WASM / codegen、PostgreSQL 插件、生产热替换、per-class TS（CatBoost 式每类统计量）、SIMD 内核（需 unsafe 或额外依赖，暂不做）
 
 ---
 

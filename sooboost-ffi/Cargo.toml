@@ -1,0 +1,19 @@
+[package]
+name = "sooboost-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "sooboost C ABI（FFI 嵌入接口）：训练 / 预测 / 序列化，供 C/C++/Python/Node 等宿主语言调用"
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+
+[lib]
+name = "sooboost_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+arrow = { version = "59.2.0", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+sooboost-core = { path = "../sooboost-core" }

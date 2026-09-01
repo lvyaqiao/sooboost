@@ -273,3 +273,22 @@
 **限制与教训**：① 行序合计与 bin 序求和存在 ulp 差异，任何改变浮点累加顺序的改动都可能翻转近平局分裂——精度红线高于速度收益；② 「给填充加增量维护以省扫描」类优化必须先估收益不对称性；③ 负结果完整落档，roadmap M11 行标注「禁止重试同方向」。
 
 **待手动验收**：无——CI 以 GitHub Actions 实跑为准。**M11 出口关闭（2026-09-01，负结果）**。下一里程碑未立项；候选：WASM/C ABI、crates.io 随下一个用户可见功能再发版、建树其他方向优化（须先过同轮 A/B 关）。
+
+### 2026-09-01 M12 交付：C ABI 嵌入接口（sooboost-ffi，模型格式零变更）
+
+**决策**：M11 出口候选中选「C ABI」——直接服务「被使用」目标（C/C++/Python/Node 嵌入），纯增量、不触碰已定版的精度/性能路径。新建 `sooboost-ffi` crate（`["cdylib", "rlib"]`），薄边界层包装门面 `GradientBoosting`；手写 `include/sooboost.h`（零工具依赖）。并行会话的内核提速方案编号顺延为 M13（见 roadmap 补11）。
+
+**动作**：
+- API 面（v1）：`sbs_train`（JSON 参数 + 行主序 f64 数据，NaN=缺失）/ `sbs_predict`（回归原值 / 二分类概率 / 多分类 argmax）/ `sbs_predict_proba`（多分类 n×k 行主序）/ `sbs_serialize`·`sbs_deserialize`（两段式，字节与 Rust save/load 完全互通）/ `sbs_model_num_features·num_classes·num_trees` / `sbs_model_free` / `sbs_last_error`（线程局部）。
+- ABI 纪律：指针参数容忍 NULL（先校验后借用，非法输入 -1 + last_error 而非 UB）；参数 JSON `deny_unknown_fields`（红线 6）；`catch_unwind` panic 屏障禁止 unwind 穿过 FFI。
+- **红线 7 调整**：core 及其余 crate `forbid(unsafe_code)` 不变；`sooboost-ffi` 为全仓唯一 unsafe 允许区——仅 raw 指针→slice/CStr 借用、Box 句柄往来、panic 屏障三类，每处附 SAFETY 注释；clippy `not_unsafe_ptr_arg_deref` 全 crate 豁免并在 crate 文档记录理由（指针校验在运行时完成，静态分析不可见调用方缓冲契约）。
+- 范围裁剪（v1）：类别特征不经 FFI 暴露（需字符串列编码，留二期）；早停/CV/温度缩放未暴露。
+
+**验证**：
+- workspace **135 测试**全绿（新增 8 项 FFI 集成测试）：三目标训练预测闭环、**FFI 与 Rust 门面同 seed 预测逐位一致**（红线 3 经边界层不变）、序列化 roundtrip 逐位一致、NaN 缺失行预测有限、7 类非法输入（非法 JSON / 未知字段 / 未知 task / 缺 n_classes / NULL / 非正维度 / 特征数不匹配 / cap 不足）全部显式报错且失败路径不产出句柄。
+- `scripts/ffi_smoke.py`（纯标准库 ctypes，无第三方依赖）：训练→预测→序列化→错误路径全闭环，本地 Windows 对 `sooboost_ffi.dll` 实跑全过；**接入 CI**（新增「Build FFI (cdylib)」与「FFI C-ABI smoke test」两步，ubuntu 加载 .so 验证跨平台）。
+- fmt/clippy `-D warnings` 干净；三道基准门禁全过（core 零改动，三集指标不受影响）。
+
+**限制**：类别特征与早停等高级面未暴露（二期）；`sbs_last_error` 为线程局部语义（跨线程取错误需自行传值）；Windows 产物名 `sooboost_ffi.dll`、Linux `libsooboost_ffi.so`（冒烟脚本已做双平台探测）。
+
+**待手动验收**：无——CI 以 GitHub Actions 实跑为准。**M12 出口关闭（2026-09-01）**。下一里程碑：M13 内核级提速已立项（doc/plans/m13-kernel-speedup.md，**待维护者批准开工**）；crates.io 发版挂起——C ABI 需随 0.3.0 一并评估（ffi crate 是否发版、头文件打包方式）。
