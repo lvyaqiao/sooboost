@@ -4,7 +4,7 @@
 > 类型：T2 台账（权威单点）｜写者：维护者（状态权威）｜读者：全员（开工前必读状态总览）
 > 范围：里程碑/路线图/当前进度/排布原因——状态只在本文件变迁；需求源头见 doc/ledgers/backlog.md
 > 关联：doc/baseline/architecture.md §里程碑映射（源头，原 04 迁移）；doc/records/（交付与验收）；doc/ledgers/backlog.md（需求池）
-> 更新：2026-09-01（M6 一期完成：早停 + CV + 特征重要度落地，v3 模型格式）
+> 更新：2026-09-01（M6 完成收口：多分类 softmax + 真实基准性能门禁）
 
 ## 里程碑与路线图
 
@@ -38,6 +38,7 @@
 - 2026-09-01（补）：**推送 master 触发 GitHub Actions 首次真实运行全绿**（run 33463341389，13 步 3m56s）——「CI 在干净 clone 上真跑绿」从纸面变为事实。**对标三巨头完成**：新增 `benchmark/compare_giants.py`（统一预算 200 轮/lr 0.1/seed 42），在 3 个真实数据集上实测——california_housing R² 0.8403（LightGBM 0.8466 最佳，差 0.6%，超 CatBoost）、diabetes R² 0.3877（全场第二，超 XGBoost/LightGBM/HGB）、breast_cancer AUC 0.9950（全场第二，超 XGBoost/LightGBM/HGB）；结论：与三巨头同一梯队（<1% 差距），小数据集上 CatBoost 领先属算法差异；速度上快于 HGB/CatBoost、慢于 LightGBM/XGBoost（SIMD/leaf-wise 优化差距留给 M6 性能门禁）。结果落盘 `benchmark/giants_comparison.{json,md}`，README 已如实更新。**M5 剩余：crates.io 0.1.0 发布**。
 - 2026-09-01（补2）：**crates.io 0.1.0 发布上线，M5 出口关闭**。`cargo publish --dry-run` 通过（49 文件/225KiB，依赖全部 crates.io 侧，打包源码编译干净），正式上传成功并确认线上可见（crate id sooboost-core，version 3123812，keywords/categories 就位，README 渲染）。README 状态行与快速开始同步更新（git 依赖 → `sooboost-core = "0.1.0"`）。M6（早停 + CV + 多分类硬化 + 特征重要度 + 性能门禁）待立项。
 - 2026-09-01（补3）：**M6 立项并完成一期（早停 + K 折交叉验证 + 特征重要度）**。① 早停：`Booster::fit_with_early_stopping`（`EarlyStoppingConfig { eval_set, rounds }`），每轮用 `Loss::value` 在验证集评估，patience 无改善即停并回滚最优轮；`boosting::Error` 新增 `EarlyStoppingStopped { best_iteration, rounds }`。② `Tree` 结构补 `split_gains` / `covers`，`NodeBuf` 分裂时写 gain——模型格式随之升级 **v3**（io 序列化同步，含 v2→v3 兼容读取）。③ 新建 `metrics.rs`：`r2_score` / `auc`。④ `Dataset` 补 `slice_rows`（arrow RecordBatch 零拷贝）/ `concatenate_rows`。⑤ 门面：`early_stopping(eval_set, rounds)` builder、`cross_validate(ds, k)`（回归 r2 / 分类 auc）、`feature_importances()`（gain / cover / frequency 三口径）。⑥ CLI 新增 `--eval` / `--early-stopping`。验证：workspace **116 测试**全绿、fmt/clippy `-D warnings` 干净、sooboost + gen 双基准门禁 exit 0；CLI 冒烟——请求 2000 轮在第 798 轮早停，3.83s vs 全轮 8.18s（省 53% 训练时间），且早停模型泛化不劣于全轮模型。多分类硬化与性能门禁留 M6 二期。
+- 2026-09-01（补4）：**M6 完成收口（二期：softmax 多分类 + 真实基准性能门禁）**。① 模型格式 **v3→v4**：loss 名后新增 `num_classes` 头（标量恒 1），多分类存 K 个 init score、树按类主序平铺；io 重构为共享 `parse` + 标量/多分类双路反序列化（`LossMismatch` 语义保持：门面探测回归→二分类→多分类，截断/checksum 失败一律原样上抛）。② `MulticlassBooster` 补 `serialize`/`deserialize`/`feature_importances`（跨类聚合）/`raw_logits_row`/`num_trees`/`learning_rate`。③ 门面：`GradientBoosting::multiclass_classifier(n_classes)`、`predict_classes`/`predict_proba`/`raw_logits`、`predict` 输出 argmax 类别、`num_classes()`；多分类 + 早停、类别数 <2、非整数/越界标签均显式报错；`metrics::accuracy` 入 CV（指标名 "accuracy"）。④ 真实基准门禁：新增 `benchmark/run_real_gate.py`（复用 compare_giants 同口径与数据加载），3 个真实集精度下限（california R²≥0.82 / diabetes R²≥0.35 / breast_cancer AUC≥0.985，即记录值减安全余量）接入 CI 第 9 步；本地实测三集 PASS（0.8403/0.3877/0.9950，与 giants_comparison 记录逐位一致）。验证：workspace **124 测试**全绿（新增 8 项多分类测试）、fmt/clippy 干净、三道基准门禁全过。多分类校准（温度缩放等）与多分类早停留远期；crates.io 0.2.0 发版待用户决定。
 
 ## 后续路线图（M4 起，2026-08-31 立项）
 
@@ -47,7 +48,7 @@
 |---|---|---|---|
 | M4 | 地基修复：能力审计（实际 API/早停/CV 是否真实现）+ 集成测试转绿 + 全量提交 git + CI 真跑绿 + 修悬空文档引用 + 空台账改为种子登记 | 完成（2026-08-31，地基修复 + CI 八步本地复验全绿） | 干净 clone `cargo test` 在 CI 全绿；git 含源码 |
 | M5 | 可用库 v0.1：稳定公共 API 门面 + 端到端 example + 对标 XGBoost/LightGBM/CatBoost（≥3 真实集）+ 发布 crates.io 0.1.0 | **完成（2026-09-01）**：门面 + example + README + 对标三巨头（3 真实集全部前二）+ crates.io 0.1.0 发布上线 | `cargo add sooboost-core` 可用；example 能跑；基准报告存在 |
-| M6 | 硬化与差异化：早停 + CV + 多分类硬化/校准 + 特征重要度 + 真实基准固化进 CI 性能门禁 | **一期完成（2026-09-01）**：早停 ✅ + K 折交叉验证 ✅ + 特征重要度 ✅（gain/cover/freq，模型格式 v3）；多分类硬化与性能门禁留二期 | 对标 LightGBM 标准集差距 ≤ 阈值；功能完备可用 |
+| M6 | 硬化与差异化：早停 + CV + 多分类硬化/校准 + 特征重要度 + 真实基准固化进 CI 性能门禁 | **完成（2026-09-01，两期）**：一期早停/CV/特征重要度 + 二期 softmax 多分类（模型格式 v4）+ 真实数据集精度下限固化为 CI 性能门禁；多分类校准与多分类早停留远期 | 对标 LightGBM 标准集差距 ≤ 阈值；功能完备可用 |
 | 远期/支线 | WASM/C ABI/codegen、PG 插件、生产热替换；sooboost-experiments（条件分布树/Flow Matching）明确降级为支线，不占核心路线图进度 | 搁置（加日期） | 等 M5-M6 有真实用户后再启动 |
 
 ## 排布原因

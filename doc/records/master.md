@@ -145,3 +145,25 @@
 **限制**：多分类硬化/校准与「真实基准固化进 CI 性能门禁」未做，留 M6 二期；早停评估每轮全量 `Loss::value` 计算，未做增量优化；速度与 LightGBM/XGBoost 的 SIMD/leaf-wise 差距仍在。
 
 **待手动验收**：无——一期改动全部提交推送，CI 以 GitHub Actions 实跑为准。二期候选：多分类硬化/校准、性能门禁固化进 CI。
+
+### 2026-09-01 M6 二期交付：softmax 多分类 + 真实基准性能门禁（M6 收口）
+
+**决策**：一期（早停/CV/重要度）收口后完成 M6 剩余两项。多分类接入门面采用「收口而非替代」一致策略——底层 `MulticlassBooster`/`fit_multiclass` 保持一等公民，门面新增 `Fitted::Multiclass` 变体；为承载多分类，模型格式 v3→v4（loss 名后加 `num_classes` 头），破坏 v2/v3 读取已在 README 显著声明（0.1.0 为 v2，pre-1.0 可接受）。性能门禁不在 CI 安装三巨头（体积/稳定性），以 giants_comparison.json 记录值减安全余量为下限，sooboost 自测跌破即视为回归。
+
+**动作**：
+- 模型格式 v4（format.rs）：`num_classes u32` 头 + 多分类 K 个 init score、树类主序平铺；`MULTICLASS_LOSS_NAME = "multiclass_softmax"`。
+- io.rs 重构：共享 `parse`（magic→版本→checksum→头→树→分箱表→类别段→元数据）+ 标量/多分类双路反序列化；`LossMismatch` 语义保持（仅目标不同的合法字节才报，门面按 回归→二分类→多分类 探测）；多分类拒绝 `has_categorical=1` 与「树数不能被类别数整除」。
+- `MulticlassBooster`：`serialize`/`deserialize`/`feature_importances`（跨全部类别聚合后归一化）/`raw_logits_row`/`num_trees`/`learning_rate`/`from_parts`。
+- 门面（api.rs）：`GradientBoosting::multiclass_classifier(n_classes)`；`predict_classes`/`predict_proba`（softmax 行和为 1）/`raw_logits`；`predict`/`predict_row` 对多分类输出 argmax 类别；`num_classes()`；标量专属操作（`raw_scores` 等）在多分类上显式报错（`Error::UnsupportedForObjective`）。入口校验：类别数 <2、早停 × 多分类、非整数/越界标签（`InvalidLabel`）均显式报错。
+- `metrics::accuracy`（非法类别标签显式报错）接入 CV，多分类指标名 "accuracy"。
+- 性能门禁：新增 `benchmark/run_real_gate.py`（import compare_giants 复用同口径/同数据加载，杜绝两套实现漂移），CI 新增第 9 步「Real-dataset performance gate」。
+- README：状态行（v4 破坏性声明）、多分类用法节、路线图 M6 收口。
+
+**验证**：
+- `cargo test --workspace`：**124 测试全绿**（一期 116 → 新增 8 项多分类测试：可分数据拟合+softmax 行和+argmax 一致、存读逐位一致+目标探测、单行=批量、非法标签/越界/类别数<2 拦截、早停显式拒绝、CV accuracy、重要度三口径、标量专属操作报错）。
+- fmt / clippy `--all-targets -D warnings` 干净。
+- 三道基准门禁全过：`sooboost --gate`（对齐 HGB，差 -0.0068 ≤0.05）、`gen --gate`（ForestFlow 4/4）、`run_real_gate.py`（california R² 0.8403 / diabetes R² 0.3877 / breast_cancer AUC 0.9950，与 giants_comparison.json 记录**逐位一致**——数据划分 seed 42 固定，交叉验证了确定性）。
+
+**限制**：多分类不支持类别特征与早停（显式报错）；校准（温度缩放/Platt）未做；模型格式 v4 不读 v2/v3 旧文件（0.1.0 用户需重训）；速度差距（SIMD/leaf-wise）延续一期结论。
+
+**待手动验收**：无——CI 以 GitHub Actions 实跑为准（三道基准门禁已全部固化进 CI）。**M6 出口关闭（2026-09-01）**。下一里程碑未立项；候选：crates.io 0.2.0 发版（多分类 + v4 格式）、多分类校准、速度优化。

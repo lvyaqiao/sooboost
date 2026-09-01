@@ -42,3 +42,6 @@ jobs:
 
       - name: Generation and imputation gate (ForestFlow)
         run: python benchmark/run_benchmark.py --mode gen --gate
+
+      - name: Real-dataset performance gate (sooboost vs recorded giants baselines)
+        run: python benchmark/run_real_gate.py

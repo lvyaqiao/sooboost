@@ -4,7 +4,9 @@
 
 > **状态：[crates.io 0.1.0 已发布](https://crates.io/crates/sooboost-core)。**
 > 核心算法（分箱 / 直方图 / 建树 / 提升 / 类别特征 / 序列化）已完整可用并通过 CI 门禁；
-> M6 硬化进行中：早停 / 交叉验证 / 特征重要度已落地，多分类硬化与性能门禁待做。生产使用请自行评估。
+> M6 硬化已收口：早停 / 交叉验证 / 特征重要度 / softmax 多分类全部落地，
+> 真实数据集精度下限已固化为 CI 性能门禁。注意：模型格式为 v4，0.1.0 之前导出的模型文件需重新训练。
+> 生产使用请自行评估。
 
 ---
 
@@ -56,7 +58,7 @@ let model = GradientBoosting::regressor()
 model.best_iteration();   // 实际使用的轮数
 model.eval_history();     // 每轮验证损失（学习曲线）
 
-// K 折交叉验证（连续分块，完全确定；指标按目标自动选 R² / AUC）
+// K 折交叉验证（连续分块，完全确定；指标按目标自动选 R² / AUC / accuracy）
 let cv = GradientBoosting::regressor()
     .n_estimators(100)
     .cross_validate(&train, 5)?;
@@ -65,6 +67,27 @@ cv.mean; cv.std; cv.fold_scores;
 // 特征重要度（gain / cover / frequency，归一化；随模型持久化，load 后可用）
 let imp = model.feature_importances(sooboost_core::boosting::ImportanceKind::Gain);
 ```
+
+### 多分类（softmax，M6 已落地）
+
+```rust
+// 每轮每类一棵树；y 必须为整数标签 ∈ [0, n_classes)
+let model = GradientBoosting::multiclass_classifier(3)
+    .n_estimators(200)
+    .learning_rate(0.1)
+    .fit(&train)?;
+
+let classes = model.predict_classes(&test)?;           // argmax 类别
+let proba = model.predict_proba(&test)?;               // [row][class]，softmax 行和为 1
+let logits = model.raw_logits(&test)?;                 // softmax 前的 logits（自定义校准用）
+model.feature_importances(ImportanceKind::Gain);       // 跨全部类别聚合
+
+// 序列化与目标自动探测与标量模型完全一致：save / load / from_bytes
+model.save("model.sbm")?;
+let loaded = GradientBoosting::load("model.sbm")?;     // 自动探测出多分类目标
+```
+
+多分类暂不支持类别特征与早停（显式报错，不静默降级）；交叉验证指标自动用 accuracy。
 
 CLI 同样支持：`--eval <valid.csv> --early-stopping <rounds>`。
 
@@ -166,9 +189,9 @@ python benchmark/run_benchmark.py --mode gen --gate
 权威记录在 [`doc/ledgers/roadmap.md`](doc/ledgers/roadmap.md)：
 
 - **M4 地基修复**（已完成）：源码全量入 git、集成测试转绿、CI 门禁复验全绿
-- **M5 可用库 v0.1**（进行中）：公共 API 门面 ✅、端到端示例 ✅、对标三巨头 ✅、发布 crates.io 0.1.0
-- **M6 硬化与差异化**（进行中）：早停 ✅ + 交叉验证 ✅、特征重要度 ✅（gain/cover/frequency，v3 格式）、多分类硬化、性能门禁
-- **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换
+- **M5 可用库 v0.1**（已完成）：公共 API 门面 ✅、端到端示例 ✅、对标三巨头 ✅、发布 crates.io 0.1.0
+- **M6 硬化与差异化**（已完成）：早停 ✅、交叉验证 ✅、特征重要度 ✅（gain/cover/frequency）、softmax 多分类 ✅（模型格式 v4）、真实基准固化进 CI 性能门禁 ✅；多分类校准与早停留远期
+- **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换、crates.io 0.2.0 发版
 
 ---
 

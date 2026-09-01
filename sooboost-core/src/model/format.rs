@@ -5,11 +5,13 @@
 //!
 //! ```text
 //! magic            [u8;4] = b"SOOB"
-//! version          u32 = 3（v1：标量模型；v2：+ 类别编码段；v3：+ 树节点 gain/cover）
+//! version          u32 = 4（v1：标量模型；v2：+ 类别编码段；v3：+ 树节点 gain/cover；
+//!                            v4：+ num_classes 头，多分类 softmax 模型）
 //! loss_name_len    u16；loss_name  UTF-8
-//! init_score       f64
+//! num_classes      u32（v4；标量模型恒为 1，多分类 ≥ 2）
+//! init_score       f64（标量）｜init_scores [f64;num_classes]（多分类）
 //! learning_rate    f64
-//! num_trees        u32
+//! num_trees        u32（多分类 = K 类 × 每类轮数，类主序平铺）
 //! trees×{ num_nodes u32
 //!         split_features [u32;num_nodes]
 //!         thresholds     [f64;num_nodes]
@@ -23,7 +25,7 @@
 //! max_bins         u32
 //! num_features     u32
 //! features×{ num_boundaries u32；boundaries [f64;num_boundaries] }
-//! has_categorical  u8（v2；0/1）
+//! has_categorical  u8（v2；0/1；多分类序列化恒为 0，暂不支持类别特征）
 //! [若 1] num_cat u32；cat_features [u32;num_cat]
 //!        每类别特征×{ num_entries u32；entries [u32 key, f64 value]（按 key 升序）
 //!                     prior f64；alpha f64 }
@@ -37,8 +39,10 @@ use super::error::ModelError;
 
 /// 模型 magic。
 pub const MAGIC: &[u8; 4] = b"SOOB";
-/// 当前模型格式版本（v3 起树节点携带 gain/cover，供特征重要度）。
-pub const VERSION: u32 = 3;
+/// 当前模型格式版本（v4 起支持多分类 softmax 模型：num_classes 头 + 类主序平铺树）。
+pub const VERSION: u32 = 4;
+/// 多分类 softmax 模型的损失名（contracts §1.2；标量名由 `Loss::name()` 提供）。
+pub const MULTICLASS_LOSS_NAME: &str = "multiclass_softmax";
 /// checksum 算法标识（FNV-1a 64）。
 pub const CHECKSUM_FNV1A64: u8 = 1;
 

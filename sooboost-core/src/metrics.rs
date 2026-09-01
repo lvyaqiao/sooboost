@@ -27,6 +27,12 @@ pub enum MetricsError {
     /// R² 的真值方差为 0（全部相等），无法定义解释方差。
     #[error("R² 退化：真值方差为 0（全部相等）")]
     DegenerateVariance,
+    /// 类别标签非法（带小数或负值，无法解释为类别）。
+    #[error("类别标签非法：{value}（必须为非负整数）")]
+    InvalidClassLabel {
+        /// 实际值。
+        value: f64,
+    },
 }
 
 /// 决定系数 R² = 1 − SS_res / SS_tot。
@@ -96,6 +102,28 @@ pub fn roc_auc(y: &[f64], prob: &[f64]) -> Result<f64, MetricsError> {
     let n_neg = neg as f64;
     let u = rank_sum_pos - n_pos * (n_pos + 1.0) / 2.0;
     Ok(u / (n_pos * n_neg))
+}
+
+/// 多分类准确率（预测类别与真值精确匹配的比例；M6-5a）。
+///
+/// `pred` 为 argmax 类别（非负整数标签）；带小数或负值视为非法输入显式报错。
+pub fn accuracy(y: &[f64], pred: &[f64]) -> Result<f64, MetricsError> {
+    if y.is_empty() || y.len() != pred.len() {
+        return Err(MetricsError::LengthMismatch {
+            y_len: y.len(),
+            pred_len: pred.len(),
+        });
+    }
+    let mut hits = 0usize;
+    for (&t, &p) in y.iter().zip(pred.iter()) {
+        if p.fract() != 0.0 || p < 0.0 {
+            return Err(MetricsError::InvalidClassLabel { value: p });
+        }
+        if t == p {
+            hits += 1;
+        }
+    }
+    Ok(hits as f64 / y.len() as f64)
 }
 
 #[cfg(test)]

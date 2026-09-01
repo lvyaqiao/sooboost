@@ -8,6 +8,7 @@
 use arrow::array::{Array, Float64Array};
 
 use crate::binning::BinTable;
+use crate::boosting::booster::ImportanceKind;
 use crate::data::missing::is_missing_value;
 use crate::data::{DataError, Dataset, MissingPolicy};
 use crate::tree::{Tree, TreeBuilder, TreeParams};
@@ -37,8 +38,78 @@ impl MulticlassBooster {
         self.trees.first().map_or(0, |v| v.len())
     }
 
+    /// 总树数（K 类 × 每类轮数）。
+    pub fn num_trees(&self) -> usize {
+        self.trees.iter().map(Vec::len).sum()
+    }
+
     pub fn init_scores(&self) -> &[f64] {
         &self.init_scores
+    }
+
+    /// 学习率（io 序列化与门面配置回填用）。
+    pub fn learning_rate(&self) -> f64 {
+        self.learning_rate
+    }
+
+    /// 类主序平铺的全部树（io 序列化用，M6-5a）。
+    pub(crate) fn trees_flat(&self) -> impl Iterator<Item = &Tree> {
+        self.trees.iter().flatten()
+    }
+
+    /// 由各部件重建（反序列化路径；结构合法性由 io 层校验，此处不再重复）。
+    pub(crate) fn from_parts(
+        n_classes: usize,
+        trees: Vec<Vec<Tree>>,
+        table: BinTable,
+        init_scores: Vec<f64>,
+        learning_rate: f64,
+    ) -> Self {
+        Self {
+            n_classes,
+            trees,
+            table,
+            init_scores,
+            learning_rate,
+        }
+    }
+
+    /// 特征重要度（跨全部类别的树聚合后归一化到和为 1；M6-5a）。
+    ///
+    /// 数据源为树节点持久化的 gain/cover（v4 格式），load 后同样可用；
+    /// 极端退化（无任何分裂）时返回全 0。
+    #[must_use]
+    pub fn feature_importances(&self, kind: ImportanceKind) -> Vec<f64> {
+        let nf = self.table.num_features();
+        let mut acc = vec![0.0f64; nf];
+        for tree in self.trees_flat() {
+            for i in 0..tree.num_nodes() {
+                if tree.left()[i] >= 0 {
+                    let f = tree.split_features()[i];
+                    acc[f] += match kind {
+                        ImportanceKind::Gain => tree.split_gains()[i],
+                        ImportanceKind::Cover => tree.node_counts()[i],
+                        ImportanceKind::Frequency => 1.0,
+                    };
+                }
+            }
+        }
+        let total: f64 = acc.iter().sum();
+        if total <= 0.0 {
+            return vec![0.0; nf];
+        }
+        acc.iter().map(|&v| v / total).collect()
+    }
+
+    /// 单行各类 logits（`init + Σ lr·tree`；门面 `predict_row` 用，M6-5a）。
+    pub(crate) fn raw_logits_row(&self, values: &[f64], is_missing: &[bool]) -> Vec<f64> {
+        let mut out = self.init_scores.clone();
+        for (k, trees) in self.trees.iter().enumerate() {
+            for tree in trees {
+                out[k] += self.learning_rate * tree.predict_one(|f| (values[f], is_missing[f]));
+            }
+        }
+        out
     }
 
     /// 模型自包含的分箱表（与 Booster 一致，供序列化/热替换）。
@@ -65,6 +136,16 @@ impl MulticlassBooster {
                     .unwrap_or(0)
             })
             .collect())
+    }
+
+    /// 序列化为字节（v4 多分类布局；M6-5a）。
+    pub fn serialize(&self) -> Vec<u8> {
+        crate::model::io::serialize_multiclass(self)
+    }
+
+    /// 从字节反序列化；损失名必须为 `multiclass_softmax`。
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, crate::model::ModelError> {
+        crate::model::io::deserialize_multiclass(bytes)
     }
 
     /// 每行原始 logits（init + Σ lr·tree）。

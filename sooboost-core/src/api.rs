@@ -35,9 +35,10 @@
 use std::path::Path;
 
 use crate::boosting::booster::Booster;
+use crate::boosting::multiclass::MulticlassBooster;
 use crate::boosting::{
     BoostingError, BoostingParams, EarlyStopping, ImportanceKind, TrainingContext, fit,
-    fit_with_early_stopping,
+    fit_multiclass, fit_with_early_stopping,
 };
 use crate::data::missing::is_missing_value;
 use crate::data::{DataError, Dataset, MissingPolicy};
@@ -85,6 +86,14 @@ pub enum Error {
         /// 传入的特征数。
         got: usize,
     },
+    /// 该操作仅特定目标支持（如概率输出仅分类目标、早停暂不支持多分类）。
+    #[error("操作不支持当前目标：{operation}（{reason}）")]
+    UnsupportedForObjective {
+        /// 操作名。
+        operation: &'static str,
+        /// 为什么不支持。
+        reason: &'static str,
+    },
     /// 含类别特征的模型不支持单行预测。
     ///
     /// 类别值必须经训练期编码解析（OOV → 先验），`&[f64]` 无法承载该语义；
@@ -103,6 +112,8 @@ pub enum Objective {
     SquaredError,
     /// 二分类：对数损失。`predict` 输出正类概率（sigmoid transform）。
     BinaryLogLoss,
+    /// 多分类：softmax（M6-5a）。每轮每类一棵树，`predict` 输出 argmax 类别。
+    MulticlassSoftmax,
 }
 
 impl Objective {
@@ -112,6 +123,7 @@ impl Objective {
         match self {
             Objective::SquaredError => SquaredError.name(),
             Objective::BinaryLogLoss => BinaryLogLoss.name(),
+            Objective::MulticlassSoftmax => crate::model::format::MULTICLASS_LOSS_NAME,
         }
     }
 }
@@ -247,6 +259,7 @@ pub struct GradientBoosting {
 enum Fitted {
     Regression(Booster<SquaredError>),
     Binary(Booster<BinaryLogLoss>),
+    Multiclass(MulticlassBooster),
 }
 
 impl GradientBoosting {
@@ -262,18 +275,38 @@ impl GradientBoosting {
         GradientBoostingBuilder::new(Objective::BinaryLogLoss)
     }
 
+    /// 多分类（softmax）构造器（M6-5a）。
+    ///
+    /// 每轮对每类建一棵树（共 `n_estimators × n_classes` 棵）；`y` 必须为
+    /// 整数标签 ∈ [0, n_classes)，非整数或越界在 `fit` 时显式报错。
+    /// 多分类暂不支持类别特征与早停（显式报错，不静默降级）。
+    #[must_use]
+    pub fn multiclass_classifier(n_classes: usize) -> GradientBoostingBuilder {
+        GradientBoostingBuilder::new_multiclass(n_classes)
+    }
+
     /// 训练目标。
     #[must_use]
     pub fn objective(&self) -> Objective {
         self.objective
     }
 
-    /// 树棵数。
+    /// 类别数（多分类模型返回 `Some(k)`；回归/二分类为 `None`）。
+    #[must_use]
+    pub fn num_classes(&self) -> Option<usize> {
+        match &self.fitted {
+            Fitted::Multiclass(m) => Some(m.n_classes()),
+            _ => None,
+        }
+    }
+
+    /// 树棵数（多分类为每类棵数，与 `n_estimators` 对齐；总数 = 该值 × 类别数）。
     #[must_use]
     pub fn num_trees(&self) -> usize {
         match &self.fitted {
             Fitted::Regression(b) => b.num_trees(),
             Fitted::Binary(b) => b.num_trees(),
+            Fitted::Multiclass(m) => m.num_trees_per_class(),
         }
     }
 
@@ -283,6 +316,7 @@ impl GradientBoosting {
         match &self.fitted {
             Fitted::Regression(b) => b.bin_table().num_features(),
             Fitted::Binary(b) => b.bin_table().num_features(),
+            Fitted::Multiclass(m) => m.bin_table().num_features(),
         }
     }
 
@@ -298,22 +332,25 @@ impl GradientBoosting {
 
     /// 特征重要度（归一化到和为 1；M6-3）。
     ///
-    /// 数据源为树节点持久化的 gain/cover（v3 格式），load 后同样可用。
-    /// 极端退化（无任何分裂）时返回全 0。
+    /// 数据源为树节点持久化的 gain/cover（v4 格式），load 后同样可用。
+    /// 多分类跨全部类别的树聚合。极端退化（无任何分裂）时返回全 0。
     #[must_use]
     pub fn feature_importances(&self, kind: ImportanceKind) -> Vec<f64> {
         match &self.fitted {
             Fitted::Regression(b) => b.feature_importances(kind),
             Fitted::Binary(b) => b.feature_importances(kind),
+            Fitted::Multiclass(m) => m.feature_importances(kind),
         }
     }
 
-    /// 实际使用的提升轮数（早停回滚后可能小于请求的 n_estimators）。
+    /// 实际使用的提升轮数（早停回滚后可能小于请求的 n_estimators；
+    /// 多分类为每类轮数）。
     #[must_use]
     pub fn best_iteration(&self) -> usize {
         match &self.fitted {
             Fitted::Regression(b) => b.best_iteration(),
             Fitted::Binary(b) => b.best_iteration(),
+            Fitted::Multiclass(m) => m.num_trees_per_class(),
         }
     }
 
@@ -323,24 +360,71 @@ impl GradientBoosting {
         match &self.fitted {
             Fitted::Regression(b) => b.eval_history(),
             Fitted::Binary(b) => b.eval_history(),
+            Fitted::Multiclass(_) => &[],
         }
     }
 
-    /// 最终预测：回归 → 原值；二分类 → 正类概率。
+    /// 最终预测：回归 → 原值；二分类 → 正类概率；多分类 → argmax 类别（f64）。
     pub fn predict(&self, ds: &Dataset) -> Result<Vec<f64>, Error> {
         Ok(match &self.fitted {
             Fitted::Regression(b) => b.predict(ds)?,
             Fitted::Binary(b) => b.predict(ds)?,
+            Fitted::Multiclass(m) => m.predict(ds)?.into_iter().map(|c| c as f64).collect(),
         })
+    }
+
+    /// 多分类预测类别（argmax；并列取小类）。
+    ///
+    /// 仅多分类模型可用，其余目标显式报错。
+    pub fn predict_classes(&self, ds: &Dataset) -> Result<Vec<usize>, Error> {
+        match &self.fitted {
+            Fitted::Multiclass(m) => Ok(m.predict(ds)?),
+            _ => Err(Error::UnsupportedForObjective {
+                operation: "predict_classes",
+                reason: "仅多分类模型有类别输出；回归用 predict，二分类用阈值化概率",
+            }),
+        }
+    }
+
+    /// 多分类各类别概率矩阵 `probs[row][class]`（softmax，行和为 1）。
+    ///
+    /// 仅多分类模型可用；二分类概率用 `predict`，回归无概率。
+    pub fn predict_proba(&self, ds: &Dataset) -> Result<Vec<Vec<f64>>, Error> {
+        match &self.fitted {
+            Fitted::Multiclass(m) => Ok(m.predict_proba(ds)?),
+            _ => Err(Error::UnsupportedForObjective {
+                operation: "predict_proba",
+                reason: "仅多分类模型输出类别概率矩阵；二分类概率用 predict",
+            }),
+        }
+    }
+
+    /// 多分类各类别 logits 矩阵 `logits[row][class]`（softmax 前）。
+    ///
+    /// 仅多分类模型可用，供自定义校准；二分类 logit 用 `raw_scores`。
+    pub fn raw_logits(&self, ds: &Dataset) -> Result<Vec<Vec<f64>>, Error> {
+        match &self.fitted {
+            Fitted::Multiclass(m) => Ok(m.raw_logits(ds)?),
+            _ => Err(Error::UnsupportedForObjective {
+                operation: "raw_logits",
+                reason: "仅多分类模型输出 logits 矩阵；标量原始分数用 raw_scores",
+            }),
+        }
     }
 
     /// 原始分数（`init + Σ lr·tree`，未经 `transform`）。
     ///
-    /// 二分类下即 logit，供自定义阈值/校准使用。
+    /// 二分类下即 logit，供自定义阈值/校准使用；多分类请用 [`Self::raw_logits`]。
     pub fn raw_scores(&self, ds: &Dataset) -> Result<Vec<f64>, Error> {
         Ok(match &self.fitted {
             Fitted::Regression(b) => b.raw_scores(ds)?,
             Fitted::Binary(b) => b.raw_scores(ds)?,
+            Fitted::Multiclass(_) => {
+                return Err(Error::UnsupportedForObjective {
+                    operation: "raw_scores",
+                    reason: "多分类的原始分数是矩阵，请用 raw_logits",
+                });
+            }
         })
     }
 
@@ -348,6 +432,7 @@ impl GradientBoosting {
     ///
     /// 缺失以 `f64::NAN` 表示，按 [`Config::missing_policy`] 解释
     /// （红线 2：语义仍由 `data::missing` 单点定义）。
+    /// 多分类返回 argmax 类别（与 [`Self::predict`] 一致）。
     pub fn predict_row(&self, values: &[f64]) -> Result<f64, Error> {
         if values.len() != self.num_features() {
             return Err(Error::FeatureCountMismatch {
@@ -359,6 +444,7 @@ impl GradientBoosting {
         let has_categorical = match &self.fitted {
             Fitted::Regression(b) => b.categorical_encoding().is_some(),
             Fitted::Binary(b) => b.categorical_encoding().is_some(),
+            Fitted::Multiclass(_) => false,
         };
         if has_categorical {
             return Err(Error::RowPredictUnsupportedWithCategorical);
@@ -371,6 +457,14 @@ impl GradientBoosting {
         Ok(match &self.fitted {
             Fitted::Regression(b) => b.predict_row(values, &is_missing),
             Fitted::Binary(b) => b.predict_row(values, &is_missing),
+            Fitted::Multiclass(m) => {
+                let logits = m.raw_logits_row(values, &is_missing);
+                logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map_or(0.0, |(i, _)| i as f64)
+            }
         })
     }
 
@@ -380,14 +474,15 @@ impl GradientBoosting {
         match &self.fitted {
             Fitted::Regression(b) => b.serialize(),
             Fitted::Binary(b) => b.serialize(),
+            Fitted::Multiclass(m) => m.serialize(),
         }
     }
 
-    /// 由字节恢复模型，目标自动探测。
+    /// 由字节恢复模型，目标自动探测（标量回归 → 二分类 → 多分类）。
     ///
-    /// 安全依据：contracts §1.2 的校验顺序是 magic → 版本 → checksum → 结构 →
-    /// 损失名，因此只有「字节本身合法、仅目标不同」才会落到 `LossMismatch`；
-    /// 截断 / checksum 失败等一律原样上抛（红线 6）。
+    /// 安全依据：contracts §1.2 的校验顺序是 magic → 版本 → checksum →
+    /// 损失名/类别数 → 结构，因此只有「字节本身合法、仅目标不同」才会落到
+    /// `LossMismatch`；截断 / checksum 失败等一律原样上抛（红线 6）。
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         match Booster::deserialize(bytes, SquaredError) {
             Ok(b) => {
@@ -399,10 +494,20 @@ impl GradientBoosting {
             Err(ModelError::LossMismatch { .. }) => {}
             Err(e) => return Err(Error::Model(e)),
         }
-        let b = Booster::deserialize(bytes, BinaryLogLoss)?;
+        match Booster::deserialize(bytes, BinaryLogLoss) {
+            Ok(b) => {
+                return Ok(Self::from_fitted(
+                    Objective::BinaryLogLoss,
+                    Fitted::Binary(b),
+                ));
+            }
+            Err(ModelError::LossMismatch { .. }) => {}
+            Err(e) => return Err(Error::Model(e)),
+        }
+        let m = MulticlassBooster::deserialize(bytes)?;
         Ok(Self::from_fitted(
-            Objective::BinaryLogLoss,
-            Fitted::Binary(b),
+            Objective::MulticlassSoftmax,
+            Fitted::Multiclass(m),
         ))
     }
 
@@ -420,8 +525,17 @@ impl GradientBoosting {
 
     fn from_fitted(objective: Objective, fitted: Fitted) -> Self {
         let config = match &fitted {
-            Fitted::Regression(b) => config_from_booster(b),
-            Fitted::Binary(b) => config_from_booster(b),
+            Fitted::Regression(b) => {
+                config_from_booster(b.num_trees(), b.learning_rate(), b.bin_table().max_bins())
+            }
+            Fitted::Binary(b) => {
+                config_from_booster(b.num_trees(), b.learning_rate(), b.bin_table().max_bins())
+            }
+            Fitted::Multiclass(m) => config_from_booster(
+                m.num_trees_per_class(),
+                m.learning_rate(),
+                m.bin_table().max_bins(),
+            ),
         };
         Self {
             objective,
@@ -432,11 +546,11 @@ impl GradientBoosting {
 }
 
 /// 由模型自身可观测字段回填配置（学习率/轮数/分箱数持久化，其余取默认）。
-fn config_from_booster<L: Loss>(b: &Booster<L>) -> Config {
+fn config_from_booster(n_estimators: usize, learning_rate: f64, max_bins: usize) -> Config {
     Config {
-        n_estimators: b.num_trees(),
-        learning_rate: b.learning_rate(),
-        max_bins: b.bin_table().max_bins(),
+        n_estimators,
+        learning_rate,
+        max_bins,
         ..Config::default()
     }
 }
@@ -447,6 +561,8 @@ pub struct GradientBoostingBuilder {
     objective: Objective,
     config: Config,
     early_stopping: Option<EarlyStopping>,
+    /// 多分类类别数（仅 `Objective::MulticlassSoftmax` 时为 Some）。
+    n_classes: Option<usize>,
 }
 
 impl GradientBoostingBuilder {
@@ -456,6 +572,17 @@ impl GradientBoostingBuilder {
             objective,
             config: Config::default(),
             early_stopping: None,
+            n_classes: None,
+        }
+    }
+
+    #[must_use]
+    fn new_multiclass(n_classes: usize) -> Self {
+        Self {
+            objective: Objective::MulticlassSoftmax,
+            config: Config::default(),
+            early_stopping: None,
+            n_classes: Some(n_classes),
         }
     }
 
@@ -540,6 +667,7 @@ impl GradientBoostingBuilder {
     /// 树集合回滚到最优轮（见 [`GradientBoosting::best_iteration`] / `eval_history`）。
     ///
     /// 验证集特征数必须与训练集一致；类别特征用训练集学到的编码解析。
+    /// 暂不支持多分类（`multiclass_classifier` + 本方法在 `fit` 时显式报错）。
     #[must_use]
     pub fn early_stopping(mut self, eval_set: Dataset, rounds: usize) -> Self {
         self.early_stopping = Some(EarlyStopping { eval_set, rounds });
@@ -560,6 +688,23 @@ impl GradientBoostingBuilder {
                 None => fit(ds, &params, BinaryLogLoss, &ctx)?,
                 Some(es) => fit_with_early_stopping(ds, &params, BinaryLogLoss, &ctx, es)?,
             }),
+            Objective::MulticlassSoftmax => {
+                let n_classes = self.n_classes.unwrap_or_default();
+                if n_classes < 2 {
+                    return Err(Error::InvalidParam {
+                        field: "n_classes",
+                        value: n_classes.to_string(),
+                        reason: "多分类至少需要 2 个类别",
+                    });
+                }
+                if self.early_stopping.is_some() {
+                    return Err(Error::UnsupportedForObjective {
+                        operation: "early_stopping",
+                        reason: "多分类早停尚未实现（每轮需对全部类别联合评估 softmax 损失）",
+                    });
+                }
+                Fitted::Multiclass(fit_multiclass(ds, &params, n_classes, &ctx)?)
+            }
         };
         Ok(GradientBoosting::from_fitted(self.objective, fitted))
     }
@@ -568,7 +713,7 @@ impl GradientBoostingBuilder {
     ///
     /// 折切分为**连续分块**（无 shuffle，完全确定性；对有序数据请先自行打乱再建
     /// `Dataset`）。指标按目标自动选择：回归 → R²（[`crate::metrics::r2_score`]），
-    /// 二分类 → AUC（[`crate::metrics::roc_auc`]）。
+    /// 二分类 → AUC（[`crate::metrics::roc_auc`]），多分类 → accuracy（M6-5a）。
     ///
     /// 返回逐折得分与汇总（均值 + 样本标准差）。训练用 `self` 的全部配置
     /// （含早停——若设置，逐折训练集内部不再二次切分早停验证集）。
@@ -592,6 +737,7 @@ impl GradientBoostingBuilder {
         let metric_name = match self.objective {
             Objective::SquaredError => "r2",
             Objective::BinaryLogLoss => "auc",
+            Objective::MulticlassSoftmax => "accuracy",
         };
 
         // 连续分块：前 n % k 折各多 1 行（与 sklearn KFold 一致的确定性切法）
@@ -618,6 +764,7 @@ impl GradientBoostingBuilder {
             let score = match self.objective {
                 Objective::SquaredError => metrics::r2_score(&y, &preds)?,
                 Objective::BinaryLogLoss => metrics::roc_auc(&y, &preds)?,
+                Objective::MulticlassSoftmax => metrics::accuracy(&y, &preds)?,
             };
             fold_scores.push(score);
             offset += len;
@@ -648,7 +795,7 @@ pub struct CvResult {
     pub mean: f64,
     /// 得分样本标准差（自由度 k−1）。
     pub std: f64,
-    /// 指标名（`"r2"` 或 `"auc"`）。
+    /// 指标名（`"r2"` / `"auc"` / `"accuracy"`）。
     pub metric: &'static str,
 }
 
@@ -1133,6 +1280,8 @@ mod tests {
         }
     }
 
+    // -- M6-5a 多分类 ---------------------------------------------------------
+
     #[test]
     fn cross_validate_classifier_uses_auc() {
         // 交错排列让每折验证集都含正负两类（连续分块 + 有序标签会使整折单类）
@@ -1152,5 +1301,285 @@ mod tests {
             assert!((0.0..=1.0).contains(&s), "AUC 越界: {s}");
         }
         assert!(cv.mean > 0.9, "可分数据 CV AUC 应接近 1，实际 {}", cv.mean);
+    }
+
+    /// 3 类可分数据：x ∈ 0..99，class = ⌊x/33⌋（单特征阈值可分）。
+    fn three_class_data() -> Dataset {
+        let x: Vec<f64> = (0..99).map(|i| i as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&v| (v / 33.0).floor()).collect();
+        dataset(x, y)
+    }
+
+    #[test]
+    fn multiclass_fits_separable_data() {
+        let ds = three_class_data();
+        let model = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(30)
+            .learning_rate(0.3)
+            .fit(&ds)
+            .expect("训练成功");
+        assert_eq!(model.objective(), Objective::MulticlassSoftmax);
+        assert_eq!(model.num_classes(), Some(3));
+        assert_eq!(model.num_trees(), 30, "num_trees 为每类棵数");
+        assert_eq!(model.num_features(), 1);
+
+        let classes = model.predict_classes(&ds).expect("类别预测成功");
+        let hits = classes
+            .iter()
+            .zip(ds.target_values().values())
+            .filter(|&(&c, &y)| c as f64 == y)
+            .count();
+        assert!(
+            hits as f64 / classes.len() as f64 > 0.9,
+            "可分数据准确率应 >0.9，实际 {hits}/{}",
+            classes.len()
+        );
+
+        // 概率矩阵：行和为 1，argmax 与 predict_classes 一致
+        let proba = model.predict_proba(&ds).expect("概率成功");
+        assert_eq!(proba.len(), 99);
+        for (row, &c) in proba.iter().zip(classes.iter()) {
+            assert_eq!(row.len(), 3);
+            assert!((row.iter().sum::<f64>() - 1.0).abs() < 1e-9, "行和应为 1");
+            let argmax = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .expect("非空");
+            assert_eq!(argmax, c, "softmax argmax 应与 predict_classes 一致");
+        }
+
+        // predict（f64 口径）与 predict_classes 一致
+        let preds = model.predict(&ds).expect("predict 成功");
+        for (p, &c) in preds.iter().zip(classes.iter()) {
+            assert_eq!(*p, c as f64);
+        }
+    }
+
+    #[test]
+    fn multiclass_save_load_roundtrip_is_bitwise_identical() {
+        let ds = three_class_data();
+        let model = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(15)
+            .seed(5)
+            .fit(&ds)
+            .expect("训练成功");
+        let loaded = GradientBoosting::from_bytes(&model.to_bytes()).expect("载入成功");
+        assert_eq!(
+            loaded.objective(),
+            Objective::MulticlassSoftmax,
+            "载入时必须探测出多分类目标"
+        );
+        assert_eq!(loaded.num_classes(), Some(3));
+        let before = model.predict_proba(&ds).expect("概率成功");
+        let after = loaded.predict_proba(&ds).expect("概率成功");
+        assert_eq!(before, after, "存读后概率矩阵必须逐位一致");
+        assert_eq!(
+            model.feature_importances(ImportanceKind::Gain),
+            loaded.feature_importances(ImportanceKind::Gain),
+            "存读后重要度必须逐位一致"
+        );
+    }
+
+    #[test]
+    fn multiclass_predict_row_matches_batch() {
+        let ds = three_class_data();
+        let model = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(20)
+            .fit(&ds)
+            .expect("训练成功");
+        let batch = model.predict(&ds).expect("批量成功");
+        for i in [0usize, 40, 80] {
+            let row = model.predict_row(&[i as f64]).expect("单行成功");
+            assert_eq!(row, batch[i], "行 {i} 单行与批量 argmax 不一致");
+        }
+        // 特征数不符 → 显式报错
+        assert!(matches!(
+            model.predict_row(&[1.0, 2.0]),
+            Err(Error::FeatureCountMismatch {
+                expected: 1,
+                got: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn multiclass_invalid_labels_and_arity_rejected() {
+        // 非整数标签
+        let x: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let bad = dataset(x.clone(), {
+            let mut y: Vec<f64> = (0..20).map(|i| (i / 10) as f64).collect();
+            y[0] = 1.5;
+            y
+        });
+        let err = GradientBoosting::multiclass_classifier(2)
+            .n_estimators(5)
+            .fit(&bad)
+            .expect_err("非整数标签必须报错");
+        assert!(
+            matches!(
+                err,
+                Error::Boosting(BoostingError::Data(DataError::InvalidLabel { .. }))
+            ),
+            "实际: {err}"
+        );
+        // 标签越界（n_classes=2，但 y 含标签 2）
+        let out_of_range = dataset(x.clone(), x.iter().map(|&v| (v / 8.0).floor()).collect());
+        let err = GradientBoosting::multiclass_classifier(2)
+            .n_estimators(5)
+            .fit(&out_of_range)
+            .expect_err("标签越界必须报错");
+        assert!(matches!(
+            err,
+            Error::Boosting(BoostingError::Data(DataError::InvalidLabel { .. }))
+        ));
+        // 类别数 < 2
+        let ds = dataset(x, vec![0.0; 20]);
+        for k in [0usize, 1] {
+            let err = GradientBoosting::multiclass_classifier(k)
+                .n_estimators(5)
+                .fit(&ds)
+                .expect_err("类别数 <2 必须报错");
+            assert!(matches!(
+                err,
+                Error::InvalidParam {
+                    field: "n_classes",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn multiclass_rejects_early_stopping_explicitly() {
+        let ds = three_class_data();
+        let (eval_x, eval_y): (Vec<f64>, Vec<f64>) = (0..99)
+            .map(|i| {
+                let x = i as f64;
+                (x, (x / 33.0).floor())
+            })
+            .unzip();
+        let eval = dataset(eval_x, eval_y);
+        let err = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(10)
+            .early_stopping(eval, 3)
+            .fit(&ds)
+            .expect_err("多分类早停必须显式报错");
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedForObjective {
+                    operation: "early_stopping",
+                    ..
+                }
+            ),
+            "实际: {err}"
+        );
+    }
+
+    #[test]
+    fn multiclass_cross_validate_uses_accuracy() {
+        // 确定性交错排列让每折覆盖全部 3 类（连续分块 + 有序标签会整折单类）
+        let n = 99usize;
+        let x: Vec<f64> = (0..n).map(|i| ((i * 37) % n) as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&v| (v / 33.0).floor()).collect();
+        let ds = dataset(x, y);
+        let cv = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(20)
+            .cross_validate(&ds, 3)
+            .expect("CV 成功");
+        assert_eq!(cv.metric, "accuracy");
+        for &s in &cv.fold_scores {
+            assert!((0.0..=1.0).contains(&s), "accuracy 越界: {s}");
+        }
+        assert!(
+            cv.mean > 0.8,
+            "可分数据 CV accuracy 应很高，实际 {}",
+            cv.mean
+        );
+    }
+
+    #[test]
+    fn multiclass_feature_importances_identifies_signal() {
+        // f0 决定类别（3 类分界在 f0），f1 常数 → gain 重要度偏向 f0
+        let n = 120;
+        let f0: Vec<f64> = (0..n).map(|i| (i % 60) as f64).collect();
+        let f1 = vec![3.25; n];
+        let y: Vec<f64> = f0.iter().map(|&v| (v / 20.0).floor().min(2.0)).collect();
+        let schema = Schema::new(vec![
+            Field::new("f0", DataType::Float64, true),
+            Field::new("f1", DataType::Float64, true),
+            Field::new("target", DataType::Float64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Float64Array::from(f0)),
+                Arc::new(Float64Array::from(f1)),
+                Arc::new(Float64Array::from(y)),
+            ],
+        )
+        .expect("构造测试 batch");
+        let ds =
+            Dataset::from_record_batch(batch, &["f0", "f1"], "target", MissingPolicy::default())
+                .expect("构造 Dataset");
+
+        let model = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(30)
+            .learning_rate(0.3)
+            .fit(&ds)
+            .expect("训练成功");
+        for kind in [
+            ImportanceKind::Gain,
+            ImportanceKind::Cover,
+            ImportanceKind::Frequency,
+        ] {
+            let imp = model.feature_importances(kind);
+            assert_eq!(imp.len(), 2);
+            assert!(
+                (imp.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+                "{kind:?} 归一化和应为 1"
+            );
+            assert!(
+                imp[0] > imp[1],
+                "{kind:?}: 信号特征 f0 重要度必须高于常数特征 f1: {imp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_only_operations_error_on_multiclass() {
+        let ds = three_class_data();
+        let reg = GradientBoosting::regressor()
+            .n_estimators(2)
+            .fit(&ds)
+            .expect("reg");
+        let err = reg.predict_proba(&ds).expect_err("回归无概率");
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedForObjective {
+                    operation: "predict_proba",
+                    ..
+                }
+            ),
+            "实际: {err}"
+        );
+        let mc = GradientBoosting::multiclass_classifier(3)
+            .n_estimators(5)
+            .fit(&ds)
+            .expect("mc");
+        let err = mc.raw_scores(&ds).expect_err("多分类无标量 raw_scores");
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedForObjective {
+                    operation: "raw_scores",
+                    ..
+                }
+            ),
+            "实际: {err}"
+        );
     }
 }
