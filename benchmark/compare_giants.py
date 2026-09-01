@@ -45,9 +45,10 @@ def find_sooboost_cli() -> pathlib.Path:
         p = pathlib.Path(env)
         if p.exists():
             return p
-    exe = pathlib.Path(__file__).parent.parent / "target" / "release" / "sooboost-cli.exe"
-    if exe.exists():
-        return exe
+    root = pathlib.Path(__file__).parent.parent / "target" / "release"
+    for exe in (root / "sooboost-cli.exe", root / "sooboost-cli"):  # Windows / Unix
+        if exe.exists():
+            return exe
     raise SystemExit("找不到 sooboost-cli（先 cargo build --release -p sooboost-cli 或设 SOOBOOST_CLI）")
 
 
