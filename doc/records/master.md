@@ -122,4 +122,4 @@
 
 - 结论（如实）：sooboost 三集**全部前二**，与三巨头同一梯队（<1% 差距）；CatBoost 小数据集领先属有序提升等算法差异。速度：快于 HGB/CatBoost，慢于 LightGBM/XGBoost（SIMD/leaf-wise 差距 → M6 性能门禁方向）。README 已如实更新（替换原「仅对标 HGB」边界声明）。
 
-**待手动验收**：M5 剩余项——发布 crates.io 0.1.0（`cargo package` 已实测通过，待 token）。
+**待手动验收**：无——**M5 出口已关闭（2026-09-01）**：crates.io 0.1.0 发布上线（`cargo publish` 成功，线上确认 [crates.io/crates/sooboost-core](https://crates.io/crates/sooboost-core)，keywords/categories/README 渲染就位），README 快速开始改为 `sooboost-core = "0.1.0"`。下一里程碑：M6 硬化与差异化（早停 + CV + 多分类 + 特征重要度 + 性能门禁），待立项。

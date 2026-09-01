@@ -2,9 +2,9 @@
 
 纯 Rust 实现的梯度提升决策树（GBDT）。目标很直接：**让 Rust 项目用表格数据时，不必为了一个 GBDT 拖进 Python 或 C++ 工具链。**
 
-> **状态：v0.1.0 开发中，尚未发布到 crates.io。**
+> **状态：[crates.io 0.1.0 已发布](https://crates.io/crates/sooboost-core)。**
 > 核心算法（分箱 / 直方图 / 建树 / 提升 / 类别特征 / 序列化）已完整可用并通过 CI 门禁；
-> 公共 API 门面刚落地，早停与交叉验证尚未实现。生产使用请自行评估。
+> 早停与交叉验证尚未实现（M6）。生产使用请自行评估。
 
 ---
 
@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-sooboost-core = { git = "https://github.com/lvyaqiao/sooboost" }
+sooboost-core = "0.1.0"
 ```
 
 ```rust
