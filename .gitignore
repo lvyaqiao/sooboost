@@ -15,6 +15,9 @@ fuzz/corpus/
 __pycache__/
 *.pyc
 
+# 三巨头对比脚本的临时工作目录（生成的 train/test CSV）
+benchmark/giants_work/
+
 # 本地工具/代理数据（WorkBuddy 项目记忆等，不入仓）
 .workbuddy/
 

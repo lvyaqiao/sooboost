@@ -1,0 +1,88 @@
+{
+  "generated_at": "2026-09-01T10:51:31+0800",
+  "budget": {
+    "n_estimators": 200,
+    "learning_rate": 0.1,
+    "seed": 42
+  },
+  "versions": {
+    "sooboost": "0.1.0(local)",
+    "xgboost": "3.4.1",
+    "lightgbm": "4.7.0",
+    "catboost": "1.2.10",
+    "sklearn": "1.9.0"
+  },
+  "results": {
+    "california_housing": {
+      "sooboost": {
+        "time_s": 1.321,
+        "r2": 0.8403341506124684
+      },
+      "xgboost": {
+        "time_s": 0.386,
+        "r2": 0.841024339604936
+      },
+      "lightgbm": {
+        "time_s": 0.145,
+        "r2": 0.8466161775300672
+      },
+      "catboost": {
+        "time_s": 0.733,
+        "r2": 0.8242683485593786
+      },
+      "sklearn_hgb": {
+        "time_s": 2.708,
+        "r2": 0.8426614020415892
+      }
+    },
+    "diabetes": {
+      "sooboost": {
+        "time_s": 0.207,
+        "r2": 0.3876609594474578
+      },
+      "xgboost": {
+        "time_s": 0.091,
+        "r2": 0.35941212315981885
+      },
+      "lightgbm": {
+        "time_s": 0.028,
+        "r2": 0.34942947151026904
+      },
+      "catboost": {
+        "time_s": 0.221,
+        "r2": 0.45210662195572393
+      },
+      "sklearn_hgb": {
+        "time_s": 0.199,
+        "r2": 0.34079097457833907
+      }
+    },
+    "breast_cancer": {
+      "sooboost": {
+        "time_s": 0.352,
+        "auc": 0.9950396825396826,
+        "accuracy": 0.9649122807017544
+      },
+      "xgboost": {
+        "time_s": 0.121,
+        "auc": 0.9937169312169312,
+        "accuracy": 0.9473684210526315
+      },
+      "lightgbm": {
+        "time_s": 0.09,
+        "auc": 0.9890873015873016,
+        "accuracy": 0.956140350877193
+      },
+      "catboost": {
+        "time_s": 1.001,
+        "auc": 0.9970238095238095,
+        "accuracy": 0.9736842105263158
+      },
+      "sklearn_hgb": {
+        "time_s": 0.254,
+        "auc": 0.9904100529100529,
+        "accuracy": 0.9649122807017544
+      }
+    }
+  }
+}

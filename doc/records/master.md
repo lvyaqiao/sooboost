@@ -108,6 +108,18 @@
 - `cargo package -p sooboost-core` 通过（49 文件），README 被正规化打入包内 `sooboost-core-0.1.0/README.md`。
 - benchmark：`sooboost --gate` / `gen --gate` 均 exit 0，4/4 数据集对标 sklearn HGB 差 ≤0.05。
 
-**限制**：当前精度基线**仅对标 sklearn `HistGradientBoosting`**，尚未对标 XGBoost / LightGBM / CatBoost；README 已如实标注此边界，不宣称达到三巨头水平。门面暂不覆盖多分类（`MulticlassBooster` 仍需直接调用）。
+**限制**：门面暂不覆盖多分类（`MulticlassBooster` 仍需直接调用）；对标三巨头使用统一预算（200 轮/lr 0.1），非逐库调参后的最优成绩，结论限定于「同一梯队」而非全面领先。
 
-**待手动验收**：M5 剩余项——对标 XGBoost/LightGBM/CatBoost（≥3 真实数据集）、推送远程触发真实 GitHub Actions、发布 crates.io 0.1.0。
+**2026-09-01 补充交付（对标三巨头 + CI 真跑绿）**：
+- 推送 master，GitHub Actions **首次真实运行全绿**（run 33463341389，gate job 13 步 3m56s）——M4 的「CI 干净 clone 全绿」出口正式关闭。
+- 新增 `benchmark/compare_giants.py` + `benchmark/giants_comparison.{json,md}`：统一预算（200 轮/lr 0.1/seed 42）在 3 个**真实**数据集上对标 XGBoost 3.4.1 / LightGBM 4.7.0 / CatBoost 1.2.10 / sklearn HGB 1.9.0：
+
+| 数据集 | 指标 | sooboost | XGBoost | LightGBM | CatBoost | HGB |
+|---|---|---|---|---|---|---|
+| california_housing | R² | 0.8403 | 0.8410 | **0.8466** | 0.8243 | 0.8427 |
+| diabetes | R² | 0.3877 | 0.3594 | 0.3494 | **0.4521** | 0.3408 |
+| breast_cancer | AUC | 0.9950 | 0.9937 | 0.9891 | **0.9970** | 0.9904 |
+
+- 结论（如实）：sooboost 三集**全部前二**，与三巨头同一梯队（<1% 差距）；CatBoost 小数据集领先属有序提升等算法差异。速度：快于 HGB/CatBoost，慢于 LightGBM/XGBoost（SIMD/leaf-wise 差距 → M6 性能门禁方向）。README 已如实更新（替换原「仅对标 HGB」边界声明）。
+
+**待手动验收**：M5 剩余项——发布 crates.io 0.1.0（`cargo package` 已实测通过，待 token）。

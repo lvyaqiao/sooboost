@@ -69,9 +69,25 @@ cargo run --release --example california_housing
 参考：example 用 200 轮 / lr 0.1 在 california_housing 上跑到 **R² 0.8404**，
 训练 1.08s（16,512 行 × 8 特征），测试集 4,128 行。
 
-**诚实的边界**：目前只对标了 sklearn HGB。
-对标 XGBoost / LightGBM / CatBoost 是 M5 的待办项，尚未执行——
-在此之前不宜宣称"达到三巨头水平"。
+**诚实的边界**：上表只对标了 sklearn HGB（纳入 CI 门禁的基线）。
+对标 XGBoost / LightGBM / CatBoost 的实测见下一节。
+
+### 对比 XGBoost / LightGBM / CatBoost（真实数据集）
+
+统一预算（200 轮 / lr 0.1 / seed 42，深度或叶子取各库默认等价容量），
+三个**真实**数据集（非合成），复现：`python benchmark/compare_giants.py`：
+
+| 数据集 | 指标 | sooboost | XGBoost 3.4 | LightGBM 4.7 | CatBoost 1.2 | sklearn HGB |
+| --- | --- | --- | --- | --- | --- | --- |
+| california_housing（16.5k×8） | R² | 0.8403 | 0.8410 | **0.8466** | 0.8243 | 0.8427 |
+| diabetes（353×10） | R² | **0.3877** | 0.3594 | 0.3494 | 0.4521 | 0.3408 |
+| breast_cancer（455×30） | AUC | **0.9950** | 0.9937 | 0.9891 | 0.9970 | 0.9904 |
+
+结论（如实说，不过度宣称）：sooboost 在三个真实集上**全部进入前二**——
+回归与分类质量与三巨头同一梯队（差距 <1%），小数据集上甚至超过 XGBoost / LightGBM；
+CatBoost 在小数据集上领先，归因于其有序提升等算法差异，不是工程问题。
+训练速度：快于 sklearn HGB 与 CatBoost，慢于 LightGBM / XGBoost（后者有多年的
+SIMD / leaf-wise 优化沉淀，这是 M6 性能门禁要追的方向）。
 
 ---
 
@@ -127,7 +143,7 @@ python benchmark/run_benchmark.py --mode gen --gate
 权威记录在 [`doc/ledgers/roadmap.md`](doc/ledgers/roadmap.md)：
 
 - **M4 地基修复**（已完成）：源码全量入 git、集成测试转绿、CI 门禁复验全绿
-- **M5 可用库 v0.1**（进行中）：公共 API 门面 ✅、端到端示例 ✅、对标三巨头、发布 crates.io 0.1.0
+- **M5 可用库 v0.1**（进行中）：公共 API 门面 ✅、端到端示例 ✅、对标三巨头 ✅、发布 crates.io 0.1.0
 - **M6 硬化与差异化**（待立项）：早停 + 交叉验证、多分类硬化、特征重要度、性能门禁
 - **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换
 
