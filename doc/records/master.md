@@ -123,3 +123,25 @@
 - 结论（如实）：sooboost 三集**全部前二**，与三巨头同一梯队（<1% 差距）；CatBoost 小数据集领先属有序提升等算法差异。速度：快于 HGB/CatBoost，慢于 LightGBM/XGBoost（SIMD/leaf-wise 差距 → M6 性能门禁方向）。README 已如实更新（替换原「仅对标 HGB」边界声明）。
 
 **待手动验收**：无——**M5 出口已关闭（2026-09-01）**：crates.io 0.1.0 发布上线（`cargo publish` 成功，线上确认 [crates.io/crates/sooboost-core](https://crates.io/crates/sooboost-core)，keywords/categories/README 渲染就位），README 快速开始改为 `sooboost-core = "0.1.0"`。下一里程碑：M6 硬化与差异化（早停 + CV + 多分类 + 特征重要度 + 性能门禁），待立项。
+
+### 2026-09-01 M6 一期交付：早停 + K 折交叉验证 + 特征重要度（模型格式 v3）
+
+**决策**：M5 出口关闭后按路线图推进 M6 硬化。一期聚焦「训练控制与可解释性」三件套（早停 / CV / 特征重要度），多分类硬化与性能门禁留二期；为承载 gain/cover 统计，模型格式从 v2 升级至 v3，序列化同步扩展并保持对旧格式读取路径的明确校验。
+
+**动作**：
+- 早停：`Booster::fit` 拆为 `fit`（原签名不变）+ `fit_with_early_stopping` + 共用 `fit_impl`；`EarlyStoppingConfig { eval_set, rounds }`，每轮以 `Loss::value` 均值在验证集评估，patience 轮无改善即停并回滚最优轮权重；`boosting::Error` 新增 `EarlyStoppingStopped { best_iteration, rounds }`。`EvalState` 采用拥有式克隆列（`Float64Array` clone 为 Arc 共享零拷贝）规避自引用借用。
+- 特征重要度底座：`Tree` 补 `split_gains: Vec<f64>` / `covers: Vec<f64>`，`NodeBuf` 分裂时写入 gain；`model/format.rs` `VERSION = 3`，io 序列化/反序列化同步两个新数组。
+- 新建 `sooboost-core/src/metrics.rs`：`r2_score` / `auc`（CV 与评估共用）。
+- `Dataset` 补 `slice_rows(offset, length)`（arrow RecordBatch 零拷贝切片）与 `concatenate_rows(&others)`；`data::Error` 新增 `RowSliceOutOfBounds` / `ConcatSchemaMismatch`。
+- 门面（api.rs）：`early_stopping(eval_set, rounds)` builder、`cross_validate(ds, k)` 返回 `CvResult { fold_scores, mean, metric }`（回归 r2 / 分类 auc）、`feature_importances()` 输出 gain / cover / frequency 三口径；`Error` 新增 `Metric` 变体。
+- CLI：`--eval <path>`（验证集）+ `--early-stopping <rounds>`，`--early-stopping` 未配 `--eval` 时显式报错。
+
+**验证**：
+- `cargo test --workspace`：**116 测试全绿**（M5 时 106 → 新增早停/CV/重要度/切片/拼接/metrics 单测，CV 测试数据用确定性交错排列避免连续分块外推问题）。
+- `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings`：干净（修掉 `!(x > 0.0)` 模式、`map_clone`、`is_some_and` 等 lint）。
+- 双基准门禁：`sooboost --gate` / `gen --gate` 均 exit 0。
+- CLI 早停冒烟（california_housing，请求 2000 轮）：**第 798 轮早停，3.83s vs 全轮 8.18s（省 53% 训练时间）**，测试口径为「早停模型泛化不劣于全轮模型」。
+
+**限制**：多分类硬化/校准与「真实基准固化进 CI 性能门禁」未做，留 M6 二期；早停评估每轮全量 `Loss::value` 计算，未做增量优化；速度与 LightGBM/XGBoost 的 SIMD/leaf-wise 差距仍在。
+
+**待手动验收**：无——一期改动全部提交推送，CI 以 GitHub Actions 实跑为准。二期候选：多分类硬化/校准、性能门禁固化进 CI。

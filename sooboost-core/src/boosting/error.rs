@@ -13,4 +13,15 @@ pub enum BoostingError {
     Binning(#[from] BinningError),
     #[error("建树错误: {0}")]
     Tree(#[from] TreeError),
+    /// 早停验证集特征数与训练集不一致（M6-1）。
+    #[error("早停验证集特征数 {eval} 与训练集 {train} 不一致")]
+    EvalSetFeatureMismatch {
+        /// 训练集特征数。
+        train: usize,
+        /// 验证集特征数。
+        eval: usize,
+    },
+    /// 早停参数非法（patience 为 0 会使第 2 轮必然停止）。
+    #[error("早停参数非法: {0}")]
+    InvalidEarlyStopping(&'static str),
 }

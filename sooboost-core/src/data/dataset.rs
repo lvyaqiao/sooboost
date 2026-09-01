@@ -162,6 +162,74 @@ impl Dataset {
         self.missing_policy
     }
 
+    /// 按行切片（零拷贝：`RecordBatch::slice` + `Float64Array::slice` 共享缓冲）。
+    ///
+    /// 用途：K 折交叉验证的折切分（M6-2）。切片越界/为空显式报错。
+    pub fn slice_rows(&self, offset: usize, length: usize) -> Result<Self, DataError> {
+        if length == 0 {
+            return Err(DataError::EmptyDataset);
+        }
+        let rows = self.batch.num_rows();
+        if offset + length > rows {
+            return Err(DataError::RowSliceOutOfBounds {
+                offset,
+                length,
+                rows,
+            });
+        }
+        Ok(Self {
+            batch: self.batch.slice(offset, length),
+            feature_indices: self.feature_indices.clone(),
+            feature_names: self.feature_names.clone(),
+            feature_categorical: self.feature_categorical.clone(),
+            target: self.target.slice(offset, length),
+            target_name: self.target_name.clone(),
+            missing_policy: self.missing_policy,
+        })
+    }
+
+    /// 行方向拼接两个数据集（特征定义与 target 列名必须一致）。
+    ///
+    /// 用途：K 折交叉验证中非首尾折的训练集拼接（M6-2）。schema 不一致显式报错。
+    pub fn concatenate_rows(&self, other: &Self) -> Result<Self, DataError> {
+        if self.feature_names != other.feature_names
+            || self.target_name != other.target_name
+            || self.feature_categorical != other.feature_categorical
+            || self.missing_policy != other.missing_policy
+        {
+            return Err(DataError::ConcatSchemaMismatch {
+                reason: "特征列/特征类型/target 列名/缺失策略不一致",
+            });
+        }
+        // target 均已是 Float64（构造契约），拼接后重建
+        let t1: arrow::array::ArrayRef = std::sync::Arc::new(self.target.clone());
+        let t2: arrow::array::ArrayRef = std::sync::Arc::new(other.target.clone());
+        let merged = arrow::compute::concat(&[&t1, &t2])?;
+        let target = merged
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or(DataError::ConcatSchemaMismatch {
+                reason: "target 拼接后非 Float64",
+            })?
+            .clone();
+        let batch = arrow::compute::concat_batches(
+            &self.batch.schema(),
+            &[
+                self.batch.slice(0, self.batch.num_rows()),
+                other.batch.clone(),
+            ],
+        )?;
+        Ok(Self {
+            batch,
+            feature_indices: self.feature_indices.clone(),
+            feature_names: self.feature_names.clone(),
+            feature_categorical: self.feature_categorical.clone(),
+            target,
+            target_name: self.target_name.clone(),
+            missing_policy: self.missing_policy,
+        })
+    }
+
     // -- 零拷贝取值 ------------------------------------------------------
 
     /// 第 `feature_idx` 个特征列的数值视图（零拷贝借用；类别特征请用 categorical_key）。

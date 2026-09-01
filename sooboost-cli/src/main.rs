@@ -1,6 +1,6 @@
 //! sooboost-cli：训练 + 预测命令行工具。
 //!
-//! 用法（M0 范围，m0-spec §2 承诺 4/5/8/9 的 CLI 出口）：
+//! 用法：
 //! ```text
 //! sooboost-cli train \
 //!   --train <train.csv> --test <test.csv> \
@@ -8,6 +8,7 @@
 //!   --task regression|binary --output <out.csv> \
 //!   [--n-estimators 100] [--learning-rate 0.1] [--max-depth 6]
 //!   [--min-samples-leaf 5] [--min-split-gain 0.0] [--max-bins 255] [--seed 42]
+//!   [--eval <valid.csv> --early-stopping <rounds>]   # M6-1 早停
 //! ```
 //!
 //! 输出 CSV 与 benchmark correctness 档同构：
@@ -21,7 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::time::Instant;
 
-use sooboost_core::boosting::{BoostingParams, TrainingContext, fit};
+use sooboost_core::boosting::{
+    BoostingParams, EarlyStopping, TrainingContext, fit, fit_with_early_stopping,
+};
 use sooboost_core::data::{Dataset, MissingPolicy};
 use sooboost_core::loss::{BinaryLogLoss, Loss, SquaredError};
 use sooboost_core::tree::TreeParams;
@@ -47,9 +50,13 @@ struct Args {
     min_split_gain: f64,
     max_bins: usize,
     seed: u64,
+    /// 早停验证集 CSV（可选，M6-1）。
+    eval: Option<PathBuf>,
+    /// 早停 patience（--eval 提供时生效）。
+    early_stopping: Option<usize>,
 }
 
-const USAGE: &str = "用法: sooboost-cli train --train <csv> --test <csv> --features f0,f1 --target target --task regression|binary --output <csv> [选项]";
+const USAGE: &str = "用法: sooboost-cli train --train <csv> --test <csv> --features f0,f1 --target target --task regression|binary --output <csv> [选项: --n-estimators --learning-rate --max-depth --min-samples-leaf --min-split-gain --max-bins --seed --eval <csv> --early-stopping <rounds>]";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("错误: {msg}");
@@ -80,6 +87,8 @@ fn parse_args() -> Args {
         min_split_gain: 0.0,
         max_bins: 255,
         seed: 42,
+        eval: None,
+        early_stopping: None,
     };
     let mut it = env::args().skip(1);
     let sub = it.next().unwrap_or_default();
@@ -130,6 +139,13 @@ fn parse_args() -> Args {
                 args.max_bins = val.parse().unwrap_or_else(|_| die("--max-bins 需为整数"))
             }
             "--seed" => args.seed = val.parse().unwrap_or_else(|_| die("--seed 需为整数")),
+            "--eval" => args.eval = Some(PathBuf::from(val)),
+            "--early-stopping" => {
+                args.early_stopping = Some(
+                    val.parse()
+                        .unwrap_or_else(|_| die("--early-stopping 需为整数")),
+                )
+            }
             other => die(format!("未知参数 '{other}'")),
         }
     }
@@ -147,6 +163,12 @@ fn parse_args() -> Args {
     }
     if args.output.as_os_str().is_empty() {
         die("缺少 --output");
+    }
+    if args.eval.is_none() && args.early_stopping.is_some() {
+        die("--early-stopping 需要 --eval <验证集 csv>");
+    }
+    if args.early_stopping.is_some_and(|r| r == 0) {
+        die("--early-stopping 至少为 1");
     }
     args
 }
@@ -188,30 +210,49 @@ fn main() {
     let ctx = TrainingContext::new(args.seed);
 
     let t0 = Instant::now();
+    let early = args.eval.as_ref().map(|p| EarlyStopping {
+        eval_set: load_dataset(p, &args.features, &args.target),
+        rounds: args.early_stopping.expect("早停参数已校验"),
+    });
+    if let Some(es) = &early {
+        println!(
+            "早停: 验证集 {} 行，patience={}",
+            es.eval_set.num_rows(),
+            es.rounds
+        );
+    }
     let (loss_name, preds, header) = match args.task {
         Task::Regression => {
-            let booster = fit(&train_ds, &params, SquaredError, &ctx)
-                .unwrap_or_else(|e| die(format!("训练失败: {e}")));
+            let booster = match &early {
+                None => fit(&train_ds, &params, SquaredError, &ctx),
+                Some(es) => fit_with_early_stopping(&train_ds, &params, SquaredError, &ctx, es),
+            }
+            .unwrap_or_else(|e| die(format!("训练失败: {e}")));
             let preds = booster
                 .predict(&test_ds)
                 .unwrap_or_else(|e| die(format!("预测失败: {e}")));
             println!(
-                "回归训练完成: 树 {} 棵，init={:.6}，耗时 {:.3}s",
+                "回归训练完成: 树 {} 棵（best_iter={}），init={:.6}，耗时 {:.3}s",
                 booster.num_trees(),
+                booster.best_iteration(),
                 booster.init_score(),
                 t0.elapsed().as_secs_f64()
             );
             (booster.loss().name(), preds, "y_true,y_pred".to_string())
         }
         Task::Binary => {
-            let booster = fit(&train_ds, &params, BinaryLogLoss, &ctx)
-                .unwrap_or_else(|e| die(format!("训练失败: {e}")));
+            let booster = match &early {
+                None => fit(&train_ds, &params, BinaryLogLoss, &ctx),
+                Some(es) => fit_with_early_stopping(&train_ds, &params, BinaryLogLoss, &ctx, es),
+            }
+            .unwrap_or_else(|e| die(format!("训练失败: {e}")));
             let probs = booster
                 .predict(&test_ds)
                 .unwrap_or_else(|e| die(format!("预测失败: {e}")));
             println!(
-                "二分类训练完成: 树 {} 棵，init={:.6}，耗时 {:.3}s",
+                "二分类训练完成: 树 {} 棵（best_iter={}），init={:.6}，耗时 {:.3}s",
                 booster.num_trees(),
+                booster.best_iteration(),
                 booster.init_score(),
                 t0.elapsed().as_secs_f64()
             );

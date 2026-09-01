@@ -13,5 +13,6 @@ pub mod binning;
 pub mod boosting;
 pub mod data;
 pub mod loss;
+pub mod metrics;
 pub mod model;
 pub mod tree;

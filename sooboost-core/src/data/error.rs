@@ -45,6 +45,24 @@ pub enum DataError {
     #[error("多分类标签 {value} 非法（需整数且 ∈ [0, {n_classes})）")]
     InvalidLabel { value: f64, n_classes: usize },
 
+    /// 拼接 schema 不一致（Dataset::concatenate_rows，M6-2）。
+    #[error("数据集拼接失败: {reason}")]
+    ConcatSchemaMismatch {
+        /// 不一致原因。
+        reason: &'static str,
+    },
+
+    /// 行切片越界（Dataset::slice_rows，M6-2）。
+    #[error("行切片越界: offset={offset} length={length} 超过总行数 {rows}")]
+    RowSliceOutOfBounds {
+        /// 起始行。
+        offset: usize,
+        /// 切片长度。
+        length: usize,
+        /// 总行数。
+        rows: usize,
+    },
+
     /// 底层 arrow 错误。
     #[error("arrow 错误: {0}")]
     Arrow(#[from] arrow::error::ArrowError),

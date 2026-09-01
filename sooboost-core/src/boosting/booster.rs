@@ -25,6 +25,35 @@ use super::context::TrainingContext;
 use super::error::BoostingError;
 use super::params::BoostingParams;
 
+/// 特征重要度口径（M6-3）。
+///
+/// - `Gain`：该特征各次分裂的增益之和（最常用，XGBoost 同名口径）；
+/// - `Cover`：该特征各次分裂节点的覆盖样本数之和；
+/// - `Frequency`：该特征被用作分裂的次数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImportanceKind {
+    /// 分裂增益之和。
+    #[default]
+    Gain,
+    /// 覆盖样本数之和。
+    Cover,
+    /// 分裂次数。
+    Frequency,
+}
+
+/// 早停配置（M6-1）。
+///
+/// 每轮提升后在 `eval_set` 上评估损失值（`Loss::value` 均值），
+/// 连续 `rounds` 轮无改善则停止，并把树集合回滚到最优轮
+/// （`Booster::num_trees()` 即最优轮树数，序列化契约不变）。
+#[derive(Debug, Clone)]
+pub struct EarlyStopping {
+    /// 验证集（拥有数据；类别特征将用训练集学到的编码解析）。
+    pub eval_set: Dataset,
+    /// patience：验证损失连续 `rounds` 轮无改善则停（必须 ≥ 1）。
+    pub rounds: usize,
+}
+
 /// 训练完成的梯度提升模型。
 ///
 /// 自包含（含 BinTable + 类别编码）：预测只用树（真实阈值），但模型序列化契约
@@ -40,6 +69,10 @@ pub struct Booster<L: Loss> {
     encoding: Option<CategoricalEncoding>,
     /// 原始特征索引中哪些是类别特征（与 encoding 对齐）。
     cat_features: Vec<usize>,
+    /// 实际使用的提升轮数（无早停 = n_estimators；早停 = 最优轮 + 1）。
+    best_iteration: usize,
+    /// 验证集损失历史（每轮一个值；无早停训练为空）。
+    eval_history: Vec<f64>,
 }
 
 impl<L: Loss> Booster<L> {
@@ -53,6 +86,43 @@ impl<L: Loss> Booster<L> {
 
     pub fn loss(&self) -> &L {
         &self.loss
+    }
+
+    /// 实际使用的提升轮数（早停回滚后可能小于请求的 n_estimators）。
+    pub fn best_iteration(&self) -> usize {
+        self.best_iteration
+    }
+
+    /// 验证集损失历史（每轮一个值；未启用早停则为空切片）。
+    pub fn eval_history(&self) -> &[f64] {
+        &self.eval_history
+    }
+
+    /// 特征重要度（归一化到和为 1；M6-3）。
+    ///
+    /// 全部特征都未参与分裂（极端退化）时返回全 0 向量。
+    /// 数据源为树节点持久化的 gain/cover（v3 格式），因此 load 后同样可用。
+    #[must_use]
+    pub fn feature_importances(&self, kind: ImportanceKind) -> Vec<f64> {
+        let nf = self.table.num_features();
+        let mut acc = vec![0.0f64; nf];
+        for tree in &self.trees {
+            for i in 0..tree.num_nodes() {
+                if tree.left()[i] >= 0 {
+                    let f = tree.split_features()[i];
+                    acc[f] += match kind {
+                        ImportanceKind::Gain => tree.split_gains()[i],
+                        ImportanceKind::Cover => tree.node_counts()[i],
+                        ImportanceKind::Frequency => 1.0,
+                    };
+                }
+            }
+        }
+        let total: f64 = acc.iter().sum();
+        if total <= 0.0 {
+            return vec![0.0; nf];
+        }
+        acc.iter().map(|&v| v / total).collect()
     }
 
     /// 模型自包含的分箱表（训练集派生的分箱边界）。
@@ -80,6 +150,9 @@ impl<L: Loss> Booster<L> {
     }
 
     /// model/ 反序列化重建（结构已校验）。
+    ///
+    /// 早停信息（best_iteration/eval_history）不属于模型格式：载入后
+    /// best_iteration = 树数，eval_history 为空。
     pub(crate) fn from_parts(
         loss: L,
         trees: Vec<Tree>,
@@ -89,6 +162,7 @@ impl<L: Loss> Booster<L> {
         encoding: Option<CategoricalEncoding>,
         cat_features: Vec<usize>,
     ) -> Self {
+        let best_iteration = trees.len();
         Self {
             loss,
             trees,
@@ -97,6 +171,8 @@ impl<L: Loss> Booster<L> {
             learning_rate,
             encoding,
             cat_features,
+            best_iteration,
+            eval_history: Vec::new(),
         }
     }
 
@@ -166,6 +242,30 @@ pub fn fit<L: Loss>(
     loss: L,
     ctx: &TrainingContext,
 ) -> Result<Booster<L>, BoostingError> {
+    fit_impl(ds, params, loss, ctx, None)
+}
+
+/// 拟合 + 早停（M6-1）。
+///
+/// 每轮在 `es.eval_set` 上评估损失均值，连续 `es.rounds` 轮无改善则停，
+/// 树集合回滚到最优轮。验证集类别特征用训练集编码解析（含 OOV → 先验）。
+pub fn fit_with_early_stopping<L: Loss>(
+    ds: &Dataset,
+    params: &BoostingParams,
+    loss: L,
+    ctx: &TrainingContext,
+    es: &EarlyStopping,
+) -> Result<Booster<L>, BoostingError> {
+    fit_impl(ds, params, loss, ctx, Some(es))
+}
+
+fn fit_impl<L: Loss>(
+    ds: &Dataset,
+    params: &BoostingParams,
+    loss: L,
+    ctx: &TrainingContext,
+    early_stopping: Option<&EarlyStopping>,
+) -> Result<Booster<L>, BoostingError> {
     // 类别特征 → ordered TS → 数值化解析数据集（M1-4，D9）
     let cat_features: Vec<usize> = (0..ds.num_features())
         .filter(|&f| ds.feature_is_categorical(f))
@@ -194,6 +294,47 @@ pub fn fit<L: Loss>(
     let ds = resolved_ds.as_ref();
     let n = ds.num_rows();
     let y: Vec<f64> = ds.target_values().values().to_vec();
+
+    // 早停验证集：入口校验 + 用训练编码解析（与 Booster::resolve 同一语义）
+    let eval: Option<EvalState> = match early_stopping {
+        None => None,
+        Some(es) => {
+            if es.rounds == 0 {
+                return Err(BoostingError::InvalidEarlyStopping(
+                    "rounds（patience）至少为 1",
+                ));
+            }
+            if es.eval_set.num_rows() == 0 {
+                return Err(BoostingError::Data(DataError::EmptyDataset));
+            }
+            if es.eval_set.num_features() != ds.num_features() {
+                return Err(BoostingError::EvalSetFeatureMismatch {
+                    train: ds.num_features(),
+                    eval: es.eval_set.num_features(),
+                });
+            }
+            let resolved_eval = match &encoding {
+                None => Cow::Borrowed(&es.eval_set),
+                Some(enc) => {
+                    let resolved = apply_encoding(&es.eval_set, enc, &cat_features)?;
+                    Cow::Owned(resolve_to_dataset(&es.eval_set, &resolved)?)
+                }
+            };
+            let eval_y: Vec<f64> = resolved_eval.target_values().values().to_vec();
+            // 列 clone 为拥有（arrow Arc 共享缓冲，零拷贝），避免自引用借用
+            let mut eval_cols_owned = Vec::with_capacity(resolved_eval.num_features());
+            for f in 0..resolved_eval.num_features() {
+                eval_cols_owned.push(resolved_eval.feature_values(f)?.clone());
+            }
+            let eval_policy = resolved_eval.missing_policy();
+            Some(EvalState {
+                y: eval_y,
+                cols: eval_cols_owned,
+                policy: eval_policy,
+            })
+        }
+    };
+
     let (table, matrix) = BinTable::build_from_dataset(ds, params.max_bins)?;
     let cols = feature_columns(ds)?;
     let policy = ds.missing_policy();
@@ -205,7 +346,18 @@ pub fn fit<L: Loss>(
 
     let mut grad = vec![0.0; n];
     let mut hess = vec![0.0; n];
-    for _ in 0..params.n_estimators {
+
+    // 早停状态：eval pred 由 init 起步，每轮与训练 pred 同步累加
+    let mut eval_pred: Vec<f64> = eval
+        .as_ref()
+        .map(|e| vec![init_score; e.y.len()])
+        .unwrap_or_default();
+    let mut eval_history: Vec<f64> = Vec::new();
+    let mut best_loss = f64::INFINITY;
+    let mut best_round = 0usize;
+    let mut rounds_since_best = 0usize;
+
+    for round in 0..params.n_estimators {
         for i in 0..n {
             grad[i] = loss.gradient(y[i], pred[i]);
             hess[i] = loss.hessian(y[i], pred[i]);
@@ -215,8 +367,42 @@ pub fn fit<L: Loss>(
             *p += params.learning_rate * predict_row(&tree, &cols, r, policy);
         }
         trees.push(tree);
+
+        // 早停评估：损失值 = mean(loss.value(y, transform(raw)))（Loss::value 契约）
+        if let Some(es) = early_stopping {
+            let state = eval.as_ref().expect("eval 与 early_stopping 同步存在");
+            let n_eval = state.y.len();
+            let eval_cols: Vec<&Float64Array> = state.cols.iter().collect();
+            for (r, p) in eval_pred.iter_mut().enumerate() {
+                *p +=
+                    params.learning_rate * predict_row(&trees[round], &eval_cols, r, state.policy);
+            }
+            let mut sum = 0.0;
+            for (&yi, &pi) in state.y.iter().zip(eval_pred.iter()) {
+                sum += loss.value(yi, loss.transform(pi));
+            }
+            let eval_loss = sum / n_eval as f64;
+            eval_history.push(eval_loss);
+
+            if eval_loss < best_loss {
+                best_loss = eval_loss;
+                best_round = round;
+                rounds_since_best = 0;
+            } else {
+                rounds_since_best += 1;
+                if rounds_since_best >= es.rounds {
+                    break;
+                }
+            }
+        }
     }
 
+    // 早停回滚：只保留到最优轮（序列化契约不变——树数本就可变）
+    if early_stopping.is_some() && trees.len() > best_round + 1 {
+        trees.truncate(best_round + 1);
+    }
+
+    let best_iteration = trees.len();
     Ok(Booster {
         loss,
         trees,
@@ -225,7 +411,16 @@ pub fn fit<L: Loss>(
         learning_rate: params.learning_rate,
         encoding,
         cat_features,
+        best_iteration,
+        eval_history,
     })
+}
+
+/// 早停验证集的解析状态（内部；列 clone 为拥有，规避自引用借用）。
+struct EvalState {
+    y: Vec<f64>,
+    cols: Vec<Float64Array>,
+    policy: crate::data::MissingPolicy,
 }
 
 /// 单棵树单行推断（零拷贝借用特征列视图）。

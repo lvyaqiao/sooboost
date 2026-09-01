@@ -4,7 +4,7 @@
 
 > **状态：[crates.io 0.1.0 已发布](https://crates.io/crates/sooboost-core)。**
 > 核心算法（分箱 / 直方图 / 建树 / 提升 / 类别特征 / 序列化）已完整可用并通过 CI 门禁；
-> 早停与交叉验证尚未实现（M6）。生产使用请自行评估。
+> M6 硬化进行中：早停 / 交叉验证 / 特征重要度已落地，多分类硬化与性能门禁待做。生产使用请自行评估。
 
 ---
 
@@ -44,6 +44,29 @@ let reloaded = GradientBoosting::load("model.sbm")?;
 
 二分类把 `regressor()` 换成 `classifier()` 即可，`predict` 输出正类概率，
 `raw_scores` 输出 logit（供自定义阈值 / 校准）。
+
+### 早停 / 交叉验证 / 特征重要度（M6 已落地）
+
+```rust
+// 早停：连续 50 轮验证损失无改善即停，并回滚到最优轮
+let model = GradientBoosting::regressor()
+    .n_estimators(2000)
+    .early_stopping(eval_ds, 50)   // 验证集 Dataset + patience
+    .fit(&train)?;
+model.best_iteration();   // 实际使用的轮数
+model.eval_history();     // 每轮验证损失（学习曲线）
+
+// K 折交叉验证（连续分块，完全确定；指标按目标自动选 R² / AUC）
+let cv = GradientBoosting::regressor()
+    .n_estimators(100)
+    .cross_validate(&train, 5)?;
+cv.mean; cv.std; cv.fold_scores;
+
+// 特征重要度（gain / cover / frequency，归一化；随模型持久化，load 后可用）
+let imp = model.feature_importances(sooboost_core::boosting::ImportanceKind::Gain);
+```
+
+CLI 同样支持：`--eval <valid.csv> --early-stopping <rounds>`。
 
 完整可运行示例：
 
@@ -144,7 +167,7 @@ python benchmark/run_benchmark.py --mode gen --gate
 
 - **M4 地基修复**（已完成）：源码全量入 git、集成测试转绿、CI 门禁复验全绿
 - **M5 可用库 v0.1**（进行中）：公共 API 门面 ✅、端到端示例 ✅、对标三巨头 ✅、发布 crates.io 0.1.0
-- **M6 硬化与差异化**（待立项）：早停 + 交叉验证、多分类硬化、特征重要度、性能门禁
+- **M6 硬化与差异化**（进行中）：早停 ✅ + 交叉验证 ✅、特征重要度 ✅（gain/cover/frequency，v3 格式）、多分类硬化、性能门禁
 - **远期 / 支线**（显式搁置）：WASM / C ABI / codegen、PostgreSQL 插件、生产热替换
 
 ---

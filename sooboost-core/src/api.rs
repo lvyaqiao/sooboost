@@ -35,10 +35,14 @@
 use std::path::Path;
 
 use crate::boosting::booster::Booster;
-use crate::boosting::{BoostingError, BoostingParams, TrainingContext, fit};
+use crate::boosting::{
+    BoostingError, BoostingParams, EarlyStopping, ImportanceKind, TrainingContext, fit,
+    fit_with_early_stopping,
+};
 use crate::data::missing::is_missing_value;
 use crate::data::{DataError, Dataset, MissingPolicy};
 use crate::loss::{BinaryLogLoss, Loss, SquaredError};
+use crate::metrics;
 use crate::model::ModelError;
 use crate::tree::TreeParams;
 
@@ -57,6 +61,9 @@ pub enum Error {
     /// 模型层错误（magic / 版本 / checksum / 结构 / 损失名）。
     #[error("模型错误: {0}")]
     Model(#[from] ModelError),
+    /// 评估指标退化或输入非法（交叉验证内计算 R²/AUC 时，M6-2）。
+    #[error("指标错误: {0}")]
+    Metric(#[from] crate::metrics::MetricsError),
     /// 文件系统 IO 错误（`save` / `load`）。
     #[error("IO 错误: {0}")]
     Io(#[from] std::io::Error),
@@ -289,6 +296,36 @@ impl GradientBoosting {
         &self.config
     }
 
+    /// 特征重要度（归一化到和为 1；M6-3）。
+    ///
+    /// 数据源为树节点持久化的 gain/cover（v3 格式），load 后同样可用。
+    /// 极端退化（无任何分裂）时返回全 0。
+    #[must_use]
+    pub fn feature_importances(&self, kind: ImportanceKind) -> Vec<f64> {
+        match &self.fitted {
+            Fitted::Regression(b) => b.feature_importances(kind),
+            Fitted::Binary(b) => b.feature_importances(kind),
+        }
+    }
+
+    /// 实际使用的提升轮数（早停回滚后可能小于请求的 n_estimators）。
+    #[must_use]
+    pub fn best_iteration(&self) -> usize {
+        match &self.fitted {
+            Fitted::Regression(b) => b.best_iteration(),
+            Fitted::Binary(b) => b.best_iteration(),
+        }
+    }
+
+    /// 早停验证集损失历史（每轮一个值；未启用早停则为空切片）。
+    #[must_use]
+    pub fn eval_history(&self) -> &[f64] {
+        match &self.fitted {
+            Fitted::Regression(b) => b.eval_history(),
+            Fitted::Binary(b) => b.eval_history(),
+        }
+    }
+
     /// 最终预测：回归 → 原值；二分类 → 正类概率。
     pub fn predict(&self, ds: &Dataset) -> Result<Vec<f64>, Error> {
         Ok(match &self.fitted {
@@ -409,6 +446,7 @@ fn config_from_booster<L: Loss>(b: &Booster<L>) -> Config {
 pub struct GradientBoostingBuilder {
     objective: Objective,
     config: Config,
+    early_stopping: Option<EarlyStopping>,
 }
 
 impl GradientBoostingBuilder {
@@ -417,6 +455,7 @@ impl GradientBoostingBuilder {
         Self {
             objective,
             config: Config::default(),
+            early_stopping: None,
         }
     }
 
@@ -497,17 +536,120 @@ impl GradientBoostingBuilder {
         self
     }
 
+    /// 启用早停（M6-1）：每轮在 `eval_set` 上评估损失，连续 `rounds` 轮无改善则停，
+    /// 树集合回滚到最优轮（见 [`GradientBoosting::best_iteration`] / `eval_history`）。
+    ///
+    /// 验证集特征数必须与训练集一致；类别特征用训练集学到的编码解析。
+    #[must_use]
+    pub fn early_stopping(mut self, eval_set: Dataset, rounds: usize) -> Self {
+        self.early_stopping = Some(EarlyStopping { eval_set, rounds });
+        self
+    }
+
     /// 训练。
     pub fn fit(self, ds: &Dataset) -> Result<GradientBoosting, Error> {
         self.config.validate()?;
         let params = self.config.boosting_params();
         let ctx = TrainingContext::new(self.config.seed);
         let fitted = match self.objective {
-            Objective::SquaredError => Fitted::Regression(fit(ds, &params, SquaredError, &ctx)?),
-            Objective::BinaryLogLoss => Fitted::Binary(fit(ds, &params, BinaryLogLoss, &ctx)?),
+            Objective::SquaredError => Fitted::Regression(match &self.early_stopping {
+                None => fit(ds, &params, SquaredError, &ctx)?,
+                Some(es) => fit_with_early_stopping(ds, &params, SquaredError, &ctx, es)?,
+            }),
+            Objective::BinaryLogLoss => Fitted::Binary(match &self.early_stopping {
+                None => fit(ds, &params, BinaryLogLoss, &ctx)?,
+                Some(es) => fit_with_early_stopping(ds, &params, BinaryLogLoss, &ctx, es)?,
+            }),
         };
         Ok(GradientBoosting::from_fitted(self.objective, fitted))
     }
+
+    /// K 折交叉验证（M6-2）。
+    ///
+    /// 折切分为**连续分块**（无 shuffle，完全确定性；对有序数据请先自行打乱再建
+    /// `Dataset`）。指标按目标自动选择：回归 → R²（[`crate::metrics::r2_score`]），
+    /// 二分类 → AUC（[`crate::metrics::roc_auc`]）。
+    ///
+    /// 返回逐折得分与汇总（均值 + 样本标准差）。训练用 `self` 的全部配置
+    /// （含早停——若设置，逐折训练集内部不再二次切分早停验证集）。
+    pub fn cross_validate(self, ds: &Dataset, k: usize) -> Result<CvResult, Error> {
+        self.config.validate()?;
+        let n = ds.num_rows();
+        if k < 2 {
+            return Err(Error::InvalidParam {
+                field: "k",
+                value: k.to_string(),
+                reason: "至少 2 折",
+            });
+        }
+        if k > n {
+            return Err(Error::InvalidParam {
+                field: "k",
+                value: k.to_string(),
+                reason: "折数不能超过样本数",
+            });
+        }
+        let metric_name = match self.objective {
+            Objective::SquaredError => "r2",
+            Objective::BinaryLogLoss => "auc",
+        };
+
+        // 连续分块：前 n % k 折各多 1 行（与 sklearn KFold 一致的确定性切法）
+        let base = n / k;
+        let rem = n % k;
+        let mut offset = 0usize;
+        let mut fold_scores = Vec::with_capacity(k);
+        for fold in 0..k {
+            let len = base + usize::from(fold < rem);
+            let eval = ds.slice_rows(offset, len)?;
+            // 折内训练集 = 其余行；两次 slice 拼接
+            let train = match offset {
+                0 => ds.slice_rows(offset + len, n - offset - len)?,
+                o if offset + len == n => ds.slice_rows(0, o)?,
+                o => {
+                    let left = ds.slice_rows(0, o)?;
+                    let right = ds.slice_rows(o + len, n - o - len)?;
+                    left.concatenate_rows(&right)?
+                }
+            };
+            let model = self.clone().fit(&train)?;
+            let preds = model.predict(&eval)?;
+            let y: Vec<f64> = eval.target_values().values().to_vec();
+            let score = match self.objective {
+                Objective::SquaredError => metrics::r2_score(&y, &preds)?,
+                Objective::BinaryLogLoss => metrics::roc_auc(&y, &preds)?,
+            };
+            fold_scores.push(score);
+            offset += len;
+        }
+
+        let k_f = k as f64;
+        let mean = fold_scores.iter().sum::<f64>() / k_f;
+        let var = fold_scores
+            .iter()
+            .map(|s| (s - mean) * (s - mean))
+            .sum::<f64>()
+            / (k_f - 1.0);
+        Ok(CvResult {
+            fold_scores,
+            mean,
+            std: var.sqrt(),
+            metric: metric_name,
+        })
+    }
+}
+
+/// 交叉验证结果（M6-2）。
+#[derive(Debug, Clone)]
+pub struct CvResult {
+    /// 逐折得分（长度 = k）。
+    pub fold_scores: Vec<f64>,
+    /// 得分均值。
+    pub mean: f64,
+    /// 得分样本标准差（自由度 k−1）。
+    pub std: f64,
+    /// 指标名（`"r2"` 或 `"auc"`）。
+    pub metric: &'static str,
 }
 
 #[cfg(test)]
@@ -796,5 +938,219 @@ mod tests {
             matches!(err, Error::Model(_)),
             "应统一为 Error::Model，实际: {err}"
         );
+    }
+
+    // -- M6-1 早停 ----------------------------------------------------------
+
+    /// 过拟合场景：训练集仅 8 个点（x=0..7, y=x），验证集 100 点连续分布。
+    /// 高学习率下训练损失很快到 0，后续轮在验证集上无改善 → 早停应触发。
+    fn overfit_pair() -> (Dataset, Dataset) {
+        let train = dataset(
+            (0..8).map(|i| i as f64).collect(),
+            (0..8).map(|i| i as f64).collect(),
+        );
+        let x: Vec<f64> = (0..100).map(|i| i as f64 / 2.0).collect();
+        let eval = dataset(x.clone(), x.to_vec());
+        (train, eval)
+    }
+
+    #[test]
+    fn early_stopping_stops_before_max_rounds() {
+        let (train, eval) = overfit_pair();
+        let model = GradientBoosting::regressor()
+            .n_estimators(200)
+            .learning_rate(0.9)
+            .max_depth(6)
+            .seed(3)
+            .early_stopping(eval.clone(), 5)
+            .fit(&train)
+            .expect("训练成功");
+        assert!(
+            model.num_trees() < 200,
+            "早停必须提前停止，实际树数 {}",
+            model.num_trees()
+        );
+        assert_eq!(model.best_iteration(), model.num_trees());
+        // 历史覆盖停止前的全部轮数（≥ 回滚后树数）
+        assert!(model.eval_history().len() >= model.num_trees());
+        // 最优轮即历史中的最小损失处
+        let best = model
+            .eval_history()
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .expect("历史非空");
+        assert_eq!(best + 1, model.num_trees());
+
+        // 早停的真实价值断言：回滚模型在验证集上的损失不劣于跑满 200 轮的模型
+        let eval_loss = |m: &GradientBoosting| -> f64 {
+            let preds = m.predict(&eval).expect("预测成功");
+            let y: Vec<f64> = eval.target_values().values().to_vec();
+            y.iter()
+                .zip(preds.iter())
+                .map(|(&a, &b)| (a - b) * (a - b))
+                .sum::<f64>()
+                / y.len() as f64
+        };
+        let full = GradientBoosting::regressor()
+            .n_estimators(200)
+            .learning_rate(0.9)
+            .max_depth(6)
+            .seed(3)
+            .fit(&train)
+            .expect("全量训练成功");
+        assert!(
+            eval_loss(&model) <= eval_loss(&full) + 1e-9,
+            "早停验证损失 {} 不应劣于全量 {}",
+            eval_loss(&model),
+            eval_loss(&full)
+        );
+    }
+
+    #[test]
+    fn early_stopping_rounds_zero_is_rejected() {
+        let (train, eval) = overfit_pair();
+        let err = GradientBoosting::regressor()
+            .n_estimators(10)
+            .early_stopping(eval, 0)
+            .fit(&train)
+            .expect_err("patience=0 必须报错");
+        assert!(matches!(
+            err,
+            Error::Boosting(BoostingError::InvalidEarlyStopping(_))
+        ));
+    }
+
+    // -- M6-3 特征重要度 ------------------------------------------------------
+
+    /// f0 承载全部信号（y = 2·f0），f1 为常数 → gain 重要度应完全偏向 f0。
+    fn two_features_signal_and_noise() -> Dataset {
+        let n = 120;
+        let f0: Vec<f64> = (0..n).map(|i| (i % 40) as f64).collect();
+        let f1 = vec![7.5; n];
+        let y: Vec<f64> = f0.iter().map(|&v| 2.0 * v).collect();
+        let schema = Schema::new(vec![
+            Field::new("f0", DataType::Float64, true),
+            Field::new("f1", DataType::Float64, true),
+            Field::new("target", DataType::Float64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Float64Array::from(f0)),
+                Arc::new(Float64Array::from(f1)),
+                Arc::new(Float64Array::from(y)),
+            ],
+        )
+        .expect("构造测试 batch");
+        Dataset::from_record_batch(batch, &["f0", "f1"], "target", MissingPolicy::default())
+            .expect("构造 Dataset")
+    }
+
+    #[test]
+    fn feature_importances_gain_identifies_signal() {
+        let ds = two_features_signal_and_noise();
+        let model = GradientBoosting::regressor()
+            .n_estimators(40)
+            .learning_rate(0.3)
+            .fit(&ds)
+            .expect("训练成功");
+        for kind in [
+            ImportanceKind::Gain,
+            ImportanceKind::Cover,
+            ImportanceKind::Frequency,
+        ] {
+            let imp = model.feature_importances(kind);
+            assert_eq!(imp.len(), 2);
+            let total: f64 = imp.iter().sum();
+            assert!(
+                (total - 1.0).abs() < 1e-9,
+                "{kind:?} 归一化和应为 1: {total}"
+            );
+            assert!(
+                imp[0] > imp[1],
+                "{kind:?}: 信号特征 f0 重要度必须高于常数特征 f1: {imp:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_importances_survive_roundtrip() {
+        // v3 格式持久化 gain/cover：load 后重要度必须可用且与原模型一致
+        let ds = two_features_signal_and_noise();
+        let model = GradientBoosting::regressor()
+            .n_estimators(30)
+            .seed(9)
+            .fit(&ds)
+            .expect("训练成功");
+        let loaded = GradientBoosting::from_bytes(&model.to_bytes()).expect("载入成功");
+        for kind in [ImportanceKind::Gain, ImportanceKind::Cover] {
+            assert_eq!(
+                model.feature_importances(kind),
+                loaded.feature_importances(kind),
+                "{kind:?}: 存读后重要度必须逐位一致"
+            );
+        }
+    }
+
+    // -- M6-2 交叉验证 --------------------------------------------------------
+
+    #[test]
+    fn cross_validate_is_deterministic_and_complete() {
+        // 连续分块的折切分对有序数据会外推（这正是文档要求先打乱的原因），
+        // 故用确定性交错排列（x = (i·37) mod 100）让每折训练集覆盖全值域。
+        let n = 100usize;
+        let x: Vec<f64> = (0..n).map(|i| ((i * 37) % n) as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&v| 2.0 * v).collect();
+        let ds = dataset(x, y);
+        let cv = || {
+            GradientBoosting::regressor()
+                .n_estimators(20)
+                .seed(42)
+                .cross_validate(&ds, 5)
+                .expect("CV 成功")
+        };
+        let a = cv();
+        let b = cv();
+        assert_eq!(a.fold_scores.len(), 5);
+        assert_eq!(a.metric, "r2");
+        assert_eq!(a.fold_scores, b.fold_scores, "同 seed 同数据必须逐位一致");
+        let mean: f64 = a.fold_scores.iter().sum::<f64>() / 5.0;
+        assert!((a.mean - mean).abs() < 1e-12);
+        // 交错数据的 R² 应为正（模型确实学到了信号）
+        assert!(a.mean > 0.9, "交错线性数据 CV R² 应接近 1，实际 {}", a.mean);
+    }
+
+    #[test]
+    fn cross_validate_k_bounds_are_validated() {
+        let ds = linear_data();
+        for k in [0, 1, 101] {
+            let err = GradientBoosting::regressor()
+                .cross_validate(&ds, k)
+                .expect_err("非法 k 必须报错");
+            assert!(matches!(err, Error::InvalidParam { field: "k", .. }));
+        }
+    }
+
+    #[test]
+    fn cross_validate_classifier_uses_auc() {
+        // 交错排列让每折验证集都含正负两类（连续分块 + 有序标签会使整折单类）
+        let n = 100usize;
+        let x: Vec<f64> = (0..n).map(|i| ((i * 37) % n) as f64).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|&v| if v >= 50.0 { 1.0 } else { 0.0 })
+            .collect();
+        let ds = dataset(x, y);
+        let cv = GradientBoosting::classifier()
+            .n_estimators(30)
+            .cross_validate(&ds, 4)
+            .expect("CV 成功");
+        assert_eq!(cv.metric, "auc");
+        for &s in &cv.fold_scores {
+            assert!((0.0..=1.0).contains(&s), "AUC 越界: {s}");
+        }
+        assert!(cv.mean > 0.9, "可分数据 CV AUC 应接近 1，实际 {}", cv.mean);
     }
 }

@@ -52,6 +52,13 @@ pub fn serialize<L: Loss>(booster: &Booster<L>) -> Vec<u8> {
         for &d in t.depths() {
             push_u32(&mut out, d as u32);
         }
+        // v3：树节点 gain/cover（特征重要度数据源，M6-3）
+        for &x in t.split_gains() {
+            push_f64(&mut out, x);
+        }
+        for &x in t.node_counts() {
+            push_f64(&mut out, x);
+        }
     }
 
     // bin 表
@@ -265,6 +272,23 @@ fn read_tree(c: &mut Cursor<&[u8]>) -> Result<Tree, ModelError> {
     for _ in 0..num_nodes {
         depths.push(read_u32(c)? as usize);
     }
+    // v3：树节点 gain/cover
+    let mut split_gains = Vec::with_capacity(num_nodes);
+    for _ in 0..num_nodes {
+        let g = read_f64(c)?;
+        if !g.is_finite() || g < 0.0 {
+            return Err(ModelError::InvalidLayout("split_gain 非有限或为负"));
+        }
+        split_gains.push(g);
+    }
+    let mut node_counts = Vec::with_capacity(num_nodes);
+    for _ in 0..num_nodes {
+        let n = read_f64(c)?;
+        if !n.is_finite() || n < 0.0 {
+            return Err(ModelError::InvalidLayout("node_count 非有限或为负"));
+        }
+        node_counts.push(n);
+    }
 
     // 节点结构校验：内部节点必须有合法左右子索引；叶子 left==right==-1。
     let nn = num_nodes as i64;
@@ -290,5 +314,7 @@ fn read_tree(c: &mut Cursor<&[u8]>) -> Result<Tree, ModelError> {
         right,
         leaf_values,
         depths,
+        split_gains,
+        node_counts,
     ))
 }

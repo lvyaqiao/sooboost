@@ -59,6 +59,8 @@ pub(crate) struct NodeBuf {
     pub(crate) left: Option<usize>,
     pub(crate) right: Option<usize>,
     pub(crate) leaf_value: Option<f64>,
+    /// 分裂增益（分裂节点记录；特征重要度 gain 口径，M6-3）。
+    pub(crate) gain: f64,
 }
 
 impl NodeBuf {
@@ -72,6 +74,7 @@ impl NodeBuf {
             left: None,
             right: None,
             leaf_value: None,
+            gain: 0.0,
         }
     }
 }
@@ -150,6 +153,7 @@ impl TreeBuilder {
                     node.missing_go_left = split.missing_go_left;
                     node.left = Some(left_id);
                     node.right = Some(right_id);
+                    node.gain = split.gain;
                     next_level.push(left_id);
                     next_level.push(right_id);
                 } else {

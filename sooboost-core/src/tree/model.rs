@@ -14,6 +14,10 @@ pub struct Tree {
     right: Vec<i32>,
     leaf_values: Vec<f64>,
     depths: Vec<usize>,
+    /// 分裂增益（每节点；叶子为 0.0）。v3 格式起随模型持久化，供特征重要度（gain）。
+    split_gains: Vec<f64>,
+    /// 节点覆盖样本数（每节点；建树时该节点分区行数）。v3 格式起持久化，供特征重要度（cover）。
+    node_counts: Vec<f64>,
 }
 
 impl Tree {
@@ -79,7 +83,18 @@ impl Tree {
         &self.depths
     }
 
+    /// 分裂增益（每节点；叶子为 0.0）。
+    pub(crate) fn split_gains(&self) -> &[f64] {
+        &self.split_gains
+    }
+
+    /// 节点覆盖样本数（每节点）。
+    pub(crate) fn node_counts(&self) -> &[f64] {
+        &self.node_counts
+    }
+
     /// 由已校验的 SoA 数组构造（model/ 反序列化用；字段合法性由调用方保证）。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_soa(
         split_features: Vec<usize>,
         thresholds: Vec<f64>,
@@ -88,6 +103,8 @@ impl Tree {
         right: Vec<i32>,
         leaf_values: Vec<f64>,
         depths: Vec<usize>,
+        split_gains: Vec<f64>,
+        node_counts: Vec<f64>,
     ) -> Self {
         Self {
             split_features,
@@ -97,6 +114,8 @@ impl Tree {
             right,
             leaf_values,
             depths,
+            split_gains,
+            node_counts,
         }
     }
 
@@ -110,8 +129,11 @@ impl Tree {
         let mut right = vec![-1i32; len];
         let mut leaf_values = vec![0.0; len];
         let mut depths = vec![0usize; len];
+        let mut split_gains = vec![0.0; len];
+        let mut node_counts = vec![0.0; len];
 
         for (i, node) in nodes.into_iter().enumerate() {
+            node_counts[i] = (node.range.1 - node.range.0) as f64;
             if let Some(f) = node.split_feature {
                 split_features[i] = f;
                 thresholds[i] = node.threshold;
@@ -121,6 +143,7 @@ impl Tree {
                     right[i] = r as i32;
                 }
                 depths[i] = node.depth;
+                split_gains[i] = node.gain;
             }
             leaf_values[i] = node.leaf_value.unwrap_or(0.0);
         }
@@ -133,6 +156,8 @@ impl Tree {
             right,
             leaf_values,
             depths,
+            split_gains,
+            node_counts,
         }
     }
 }

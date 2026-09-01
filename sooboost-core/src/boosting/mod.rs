@@ -15,7 +15,7 @@ pub mod error;
 pub mod multiclass;
 pub mod params;
 
-pub use booster::{Booster, fit};
+pub use booster::{Booster, EarlyStopping, ImportanceKind, fit, fit_with_early_stopping};
 pub use context::TrainingContext;
 pub use error::BoostingError;
 pub use multiclass::{MulticlassBooster, fit_multiclass};

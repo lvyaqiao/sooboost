@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! magic            [u8;4] = b"SOOB"
-//! version          u32 = 2（v1：标量模型；v2：+ 类别编码段）
+//! version          u32 = 3（v1：标量模型；v2：+ 类别编码段；v3：+ 树节点 gain/cover）
 //! loss_name_len    u16；loss_name  UTF-8
 //! init_score       f64
 //! learning_rate    f64
@@ -17,7 +17,9 @@
 //!         left           [i32;num_nodes]
 //!         right          [i32;num_nodes]
 //!         leaf_values    [f64;num_nodes]
-//!         depths         [u32;num_nodes] }
+//!         depths         [u32;num_nodes]
+//!         split_gains    [f64;num_nodes]（v3；叶子为 0）
+//!         node_counts    [f64;num_nodes]（v3；节点覆盖样本数） }
 //! max_bins         u32
 //! num_features     u32
 //! features×{ num_boundaries u32；boundaries [f64;num_boundaries] }
@@ -35,8 +37,8 @@ use super::error::ModelError;
 
 /// 模型 magic。
 pub const MAGIC: &[u8; 4] = b"SOOB";
-/// 当前模型格式版本（v2 起含类别编码段）。
-pub const VERSION: u32 = 2;
+/// 当前模型格式版本（v3 起树节点携带 gain/cover，供特征重要度）。
+pub const VERSION: u32 = 3;
 /// checksum 算法标识（FNV-1a 64）。
 pub const CHECKSUM_FNV1A64: u8 = 1;
 
